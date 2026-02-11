@@ -1,0 +1,56 @@
+{
+  "template_version": "1.0",
+  "output": {
+    "width": 1080,
+    "height": 1350,
+    "format": "jpeg",
+    "quality": 90
+  },
+  "slide_count": 3,
+  "slides": [
+    {
+      "index": 1,
+      "background": "assets/bg_01.png",
+      "placeholders": [
+        {
+          "key": "headline",
+          "x": 80,
+          "y": 140,
+          "w": 920,
+          "h": 220,
+          "font_family": "Inter",
+          "font_size": 72,
+          "min_font_size": 44,
+          "line_height": 1.1,
+          "align": "left",
+          "fit_mode": "SHRINK_TO_FIT",
+          "max_lines": 3
+        },
+        {
+          "key": "body",
+          "x": 80,
+          "y": 400,
+          "w": 920,
+          "h": 700,
+          "font_family": "Inter",
+          "font_size": 44,
+          "min_font_size": 30,
+          "line_height": 1.2,
+          "align": "left",
+          "fit_mode": "SHRINK_TO_FIT",
+          "max_lines": 8
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "background": "assets/bg_02.png",
+      "placeholders": []
+    },
+    {
+      "index": 3,
+      "background": "assets/bg_03.png",
+      "placeholders": []
+    }
+  ]
+}

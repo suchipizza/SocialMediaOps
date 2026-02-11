@@ -1,0 +1,1 @@
+console.log("Workers entrypoint. Run specific workers: npm run publisher | npm run renderer");

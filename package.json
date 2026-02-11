@@ -1,0 +1,27 @@
+{
+  "name": "content-ops-root",
+  "private": true,
+  "workspaces": [
+    "content-ops-codex-pack/apps/*",
+    "content-ops-codex-pack/packages/*",
+    "content-ops-codex-pack/services/*"
+  ],
+  "scripts": {
+    "sync:env:web": "node ./sync-env.mjs",
+    "sync:env": "npm run sync:env:web",
+    "predev:web": "npm run sync:env:web",
+    "dev:web": "NEXT_DISABLE_TURBOPACK=1 dotenv -e content-ops-codex-pack/.env -- npm run dev -w content-ops-web",
+    "dev:web:fast": "dotenv -e content-ops-codex-pack/.env -- npm run dev -w content-ops-web",
+    "build:web": "npm run build -w content-ops-web",
+    "lint:web": "npm run lint -w content-ops-web",
+    "install:playwright": "npm exec --workspace content-ops-renderer -- playwright install",
+    "dev:renderer": "dotenv -e content-ops-codex-pack/.env -- npm run dev -w content-ops-renderer",
+    "dev:workers": "dotenv -e content-ops-codex-pack/.env -- npm run dev -w content-ops-workers",
+    "dev:publisher": "dotenv -e content-ops-codex-pack/.env -- npm run publisher -w content-ops-workers",
+    "dev:worker-renderer": "dotenv -e content-ops-codex-pack/.env -- npm run renderer -w content-ops-workers",
+    "build:manifest": "npm run build -w @content-ops/manifest-validator"
+  },
+  "devDependencies": {
+    "dotenv-cli": "^7.4.2"
+  }
+}

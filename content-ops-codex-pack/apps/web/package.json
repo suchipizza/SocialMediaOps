@@ -1,0 +1,25 @@
+{
+  "name": "content-ops-web",
+  "private": true,
+  "scripts": {
+    "predev": "node ../../../sync-env.mjs",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "jszip": "^3.10.1",
+    "playwright": "^1.47.0",
+    "papaparse": "^5.5.3",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.10",
+    "typescript": "5.9.3"
+  }
+}

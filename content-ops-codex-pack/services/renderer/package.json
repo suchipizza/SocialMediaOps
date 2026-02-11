@@ -1,0 +1,13 @@
+{
+  "name": "content-ops-renderer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ./src/index.js",
+    "build": "echo 'TODO: add TS build'",
+    "render:example": "node ./src/example.js"
+  },
+  "dependencies": {
+    "playwright": "^1.47.0"
+  }
+}

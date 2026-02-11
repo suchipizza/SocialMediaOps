@@ -1,0 +1,11 @@
+{
+  "name": "content-ops-workers",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ./src/index.js",
+    "publisher": "node ./src/publisher.js",
+    "renderer": "node ./src/renderer.js"
+  },
+  "dependencies": {}
+}
