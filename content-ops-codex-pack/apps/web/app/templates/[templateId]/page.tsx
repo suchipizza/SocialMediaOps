@@ -39,6 +39,7 @@ async function rebuildPreview(formData: FormData) {
       .from("templates")
       .update({
         preview_assets: previewAssets,
+        manifest_json: template.manifest_json,
         status: "VALID",
         preview_error: null,
         preview_generated_at: new Date().toISOString(),

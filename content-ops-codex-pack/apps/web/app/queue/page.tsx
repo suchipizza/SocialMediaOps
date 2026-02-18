@@ -31,7 +31,7 @@ export default async function QueuePage({
   const { data: posts, error: postsError } = await supabase
     .from("posts")
     .select("id,status,ordering_index,created_at,pillar_id,pillars(name)")
-    .in("status", ["READY_FOR_REVIEW", "DRAFT"])
+    .in("status", ["READY_FOR_REVIEW", "DRAFT", "APPROVED"])
     .order("created_at", { ascending: false })
     .limit(50);
 

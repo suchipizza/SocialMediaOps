@@ -49,7 +49,8 @@ export const FormatCManifestSchema = z.object({
     query: z.object({
       slide: z.string().min(1),
       data: z.string().min(1)
-    })
+    }),
+    capture: z.enum(["slide", "inner", "auto"]).optional()
   })
 });
 

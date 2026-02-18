@@ -7,5 +7,8 @@
     "publisher": "node ./src/publisher.js",
     "renderer": "node ./src/renderer.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "@supabase/supabase-js": "^2.48.0"
+  }
 }

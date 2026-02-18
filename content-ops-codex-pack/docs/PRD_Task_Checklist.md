@@ -1,6 +1,6 @@
 # PRD Task Checklist — Format C + Template Preview
 
-_Last updated: 2026-02-10_
+_Last updated: 2026-02-18_
 
 ## Checklist
 
@@ -43,7 +43,7 @@ _Last updated: 2026-02-10_
 - [x] Add “Clear preview cache” button.
 
 ### Renderer Pipeline (Production)
-- [ ] Implement full Format C render pipeline in `services/renderer` (load pack → build/cache → Playwright → upload assets → update DB).
+- [x] Implement full Format C render pipeline in `services/renderer` (load pack → build/cache → Playwright → upload assets → update DB).
 - [ ] Implement Format A/B production render pipeline in `services/renderer` (HTML/manifest → Playwright → upload assets).
 
 ### Publishing (Distribution)
@@ -67,7 +67,7 @@ _Last updated: 2026-02-10_
 |---|---|---|---|
 | Format B preview | TBD | Not started | Implement preview generator for background‑image packs and manifest text boxes. |
 | Format C preview manifest requirement | TBD | Partially done | Enforce `manifest.json` presence for Format C (remove default manifest fallback). |
-| Production renderer (Format C) | TBD | Not started | Implement `services/renderer` build/cache/render/upload pipeline. |
+| Production renderer (Format C) | TBD | Done | Monitor worker schedule + retries. |
 | Production renderer (Format A/B) | TBD | Not started | Implement HTML/manifest render pipeline. |
 | Security sandboxing | TBD | Not started | Containerize builds and block network egress. |
 | Cache TTL | TBD | Not started | Add TTL/cleanup for `.cache/template-builds`. |

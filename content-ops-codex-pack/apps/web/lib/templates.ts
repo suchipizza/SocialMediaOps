@@ -60,7 +60,7 @@ function buildDefaultFormatCManifest() {
     template_version: "1.0",
     output: { width: 1080, height: 1350, format: "jpeg", quality: 90 },
     slide_count: 10,
-    render: { mode: "querystring", query: { slide: "slide", data: "data" } }
+    render: { mode: "querystring", query: { slide: "slide", data: "data" }, capture: "auto" }
   };
 }
 
@@ -163,6 +163,7 @@ export async function createTemplateFromZip(params: {
         .from("templates")
         .update({
           preview_assets: previewAssets,
+          manifest_json: manifest,
           status: "VALID",
           preview_error: null,
           preview_generated_at: new Date().toISOString()

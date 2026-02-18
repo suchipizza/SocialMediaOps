@@ -18,3 +18,7 @@ This scaffold is designed to be pasted into a repo and completed with Codex. It 
 - This is a scaffold: functions contain TODOs and clear interfaces.
 - Storage: use S3/R2/Supabase Storage with stable public URLs for IG publishing.
 
+## Renderer (Format C)
+To render approved posts with Format C templates:
+- Ensure `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and `SUPABASE_STORAGE_BUCKET` are set.
+- Run the worker: `npm run renderer -w content-ops-workers`

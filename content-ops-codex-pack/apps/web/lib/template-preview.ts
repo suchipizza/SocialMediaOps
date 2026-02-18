@@ -30,7 +30,11 @@ type FormatCManifest = {
   template_version: string;
   output: ManifestOutput;
   slide_count: number;
-  render: { mode: "querystring"; query: { slide: string; data: string } };
+  render: {
+    mode: "querystring";
+    query: { slide: string; data: string };
+    capture?: "slide" | "inner" | "auto";
+  };
 };
 
 function getRepoRoot() {
@@ -379,7 +383,7 @@ async function renderFormatCSlides(params: {
       }
     });
 
-    await page.evaluate(({ slideIndex, slideCount, width, height, fields }) => {
+    const selection = await page.evaluate(({ slideIndex, slideCount, width, height, fields }) => {
       const allSlides = Array.from(document.querySelectorAll("[id^='slide-']"))
         .filter(node => node instanceof HTMLElement) as HTMLElement[];
       const parsedSlides = allSlides.map(node => {
@@ -436,7 +440,9 @@ async function renderFormatCSlides(params: {
       if (!wrapper) {
         wrapper = parsedSlides[0]?.node || null;
       }
-      if (!wrapper) return;
+      if (!wrapper) return { wrapperMatches: true, selectedIsWrapper: true };
+      const wrapperMatches =
+        Math.abs(wrapper.offsetWidth - width) <= 2 && Math.abs(wrapper.offsetHeight - height) <= 2;
 
       const nodes = [wrapper, ...Array.from(wrapper.querySelectorAll("*"))].filter(
         node => node instanceof HTMLElement
@@ -844,7 +850,16 @@ async function renderFormatCSlides(params: {
           setText(pageNode, pageNumber, true);
         }
       }
+
+      return { wrapperMatches, selectedIsWrapper: slideRoot === wrapper };
     }, { slideIndex: i, slideCount, width, height, fields: placeholders });
+
+    if (i === 1) {
+      const captureMode = params.manifest.render?.capture || "auto";
+      if (captureMode === "auto" && selection) {
+        params.manifest.render.capture = selection.wrapperMatches && selection.selectedIsWrapper ? "slide" : "inner";
+      }
+    }
 
     await page.waitForTimeout(50);
     const handle = await page.$("[data-preview-root='true']");
