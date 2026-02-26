@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "../../lib/supabase";
 import { ingestGoogleSheetToJob } from "../../lib/ingest";
+import { applyScheduleForJob } from "../../lib/scheduling";
 
 export const dynamic = "force-dynamic";
 
@@ -45,6 +46,7 @@ async function createJob(formData: FormData) {
 
     try {
       const result = await ingestGoogleSheetToJob({ projectId, jobId: job.id, sheetUrl, templateId });
+      await applyScheduleForJob(supabase, job.id);
       revalidatePath("/jobs");
       revalidatePath("/queue");
       redirect(
@@ -85,6 +87,7 @@ async function ingestSheetsIntoExistingJob(formData: FormData) {
       sheetUrl,
       templateId: job.template_id
     });
+    await applyScheduleForJob(supabase, job.id);
     revalidatePath("/jobs");
     revalidatePath("/queue");
     redirect(
@@ -149,6 +152,38 @@ async function changeJobTemplate(formData: FormData) {
   redirect("/jobs?template_changed=1");
 }
 
+async function updateJobSettings(formData: FormData) {
+  "use server";
+  const jobId = String(formData.get("job_id") || "").trim();
+  const startDate = String(formData.get("start_date") || "").trim();
+  const targetCount = Number(formData.get("target_post_count") || 21);
+  if (!jobId || !startDate) {
+    redirect(`/jobs?error=${encodeURIComponent("Job and start date are required.")}`);
+  }
+
+  const supabase = createSupabaseServerClient();
+  const { error } = await supabase
+    .from("jobs")
+    .update({
+      start_date: startDate,
+      target_post_count: Number.isNaN(targetCount) ? 21 : targetCount
+    })
+    .eq("id", jobId);
+  if (error) {
+    redirect(`/jobs?error=${encodeURIComponent(error.message || "job_settings_update_failed")}`);
+  }
+
+  try {
+    await applyScheduleForJob(supabase, jobId);
+  } catch (scheduleError: any) {
+    redirect(`/jobs?error=${encodeURIComponent(scheduleError?.message || "job_schedule_sync_failed")}`);
+  }
+
+  revalidatePath("/jobs");
+  revalidatePath("/queue");
+  redirect("/jobs?settings_updated=1");
+}
+
 export default async function JobsPage({
   searchParams
 }: {
@@ -162,6 +197,7 @@ export default async function JobsPage({
   const templateChanged = Array.isArray(params.template_changed)
     ? params.template_changed[0]
     : params.template_changed;
+  const settingsUpdated = Array.isArray(params.settings_updated) ? params.settings_updated[0] : params.settings_updated;
   const createdPosts = Array.isArray(params.created_posts) ? params.created_posts[0] : params.created_posts;
   const createdPillars = Array.isArray(params.created_pillars) ? params.created_pillars[0] : params.created_pillars;
   const skippedRows = Array.isArray(params.skipped_rows) ? params.skipped_rows[0] : params.skipped_rows;
@@ -231,6 +267,13 @@ export default async function JobsPage({
         <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
           <h3>Template updated</h3>
           <p>The job and its posts now point to the selected template.</p>
+        </div>
+      ) : null}
+
+      {settingsUpdated ? (
+        <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
+          <h3>Job settings updated</h3>
+          <p>Start date/target were saved and post publish timestamps were resynced from project slots.</p>
         </div>
       ) : null}
 
@@ -363,6 +406,28 @@ export default async function JobsPage({
                             </select>
                           </div>
                           <button type="submit">Update template</button>
+                        </form>
+                      </details>
+                      <details style={{ marginTop: 12 }}>
+                        <summary className="chip" style={{ cursor: "pointer" }}>
+                          Edit schedule
+                        </summary>
+                        <form className="form" action={updateJobSettings} style={{ marginTop: 12 }}>
+                          <input type="hidden" name="job_id" value={job.id} />
+                          <div className="field">
+                            <label htmlFor={`job_start_${job.id}`}>Start date</label>
+                            <input id={`job_start_${job.id}`} name="start_date" type="date" defaultValue={job.start_date} required />
+                          </div>
+                          <div className="field">
+                            <label htmlFor={`job_target_${job.id}`}>Target posts</label>
+                            <input
+                              id={`job_target_${job.id}`}
+                              name="target_post_count"
+                              type="number"
+                              defaultValue={job.target_post_count || 21}
+                            />
+                          </div>
+                          <button type="submit">Save + resync schedule</button>
                         </form>
                       </details>
                       <form action={deleteJob} style={{ marginTop: 12 }}>

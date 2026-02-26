@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
 import JSZip from "jszip";
-import { createSupabaseServerClient } from "../../../../lib/supabase";
+import { createSupabaseServerClient, getSupabaseStorageBucket } from "../../../../lib/supabase";
 import { renderFormatCPostSlides } from "../../../../lib/template-preview";
 
 export const dynamic = "force-dynamic";
@@ -29,20 +29,83 @@ async function readFileIfExists(filePath: string) {
   }
 }
 
+function extractStoragePath(url: string | null | undefined, bucket: string) {
+  if (!url) return null;
+  try {
+    if (!url.includes("://")) {
+      return url.replace(/^\/+/, "");
+    }
+    const parsed = new URL(url);
+    const pathName = parsed.pathname;
+    const publicMarker = `/storage/v1/object/public/${bucket}/`;
+    const signedMarker = `/storage/v1/object/sign/${bucket}/`;
+    if (pathName.includes(publicMarker)) {
+      return pathName.split(publicMarker)[1]?.replace(/^\/+/, "") || null;
+    }
+    if (pathName.includes(signedMarker)) {
+      return pathName.split(signedMarker)[1]?.replace(/^\/+/, "") || null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function toErrorImage(message: string) {
+  const safe = message.replace(/[<>&]/g, ch => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[ch] || ch));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350"><rect width="1080" height="1350" fill="#0d1117"/><g fill="#f0f6fc"><text x="64" y="120" font-family="Inter, Arial, sans-serif" font-size="40" font-weight="700">Preview Error</text><text x="64" y="190" font-family="Inter, Arial, sans-serif" font-size="28">${safe}</text></g></svg>`;
+  return new NextResponse(svg, {
+    status: 200,
+    headers: {
+      "content-type": "image/svg+xml; charset=utf-8",
+      "cache-control": "no-store",
+      "x-preview-error": message
+    }
+  });
+}
+
+async function fetchTemplateZip(params: {
+  templatePackUrl: string;
+  supabase: ReturnType<typeof createSupabaseServerClient>;
+}) {
+  const byUrl = async () => {
+    try {
+      const res = await fetch(params.templatePackUrl);
+      if (!res.ok) return null;
+      const buf = Buffer.from(await res.arrayBuffer());
+      const zip = await JSZip.loadAsync(buf);
+      const templateHash = createHash("sha256").update(buf).digest("hex");
+      return { zip, templateHash };
+    } catch {
+      return null;
+    }
+  };
+
+  const firstTry = await byUrl();
+  if (firstTry) return firstTry;
+
+  const bucket = getSupabaseStorageBucket();
+  const storagePath = extractStoragePath(params.templatePackUrl, bucket);
+  if (!storagePath) return null;
+  const { data, error } = await params.supabase.storage.from(bucket).download(storagePath);
+  if (error || !data) return null;
+
+  const buffer = Buffer.from(await data.arrayBuffer());
+  const zip = await JSZip.loadAsync(buffer);
+  const templateHash = createHash("sha256").update(buffer).digest("hex");
+  return { zip, templateHash };
+}
+
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const postIdRaw = url.searchParams.get("post_id");
   const slideParam = url.searchParams.get("slide");
   const hashParam = url.searchParams.get("hash") || "";
 
-  if (!postIdRaw) {
-    return new NextResponse("post_id_required", { status: 400 });
-  }
+  if (!postIdRaw) return toErrorImage("post_id_required");
 
   const slideIndex = Number(slideParam || "0");
-  if (!Number.isFinite(slideIndex) || slideIndex < 1) {
-    return new NextResponse("slide_required", { status: 400 });
-  }
+  if (!Number.isFinite(slideIndex) || slideIndex < 1) return toErrorImage("slide_required");
 
   const postId = normalizeId(postIdRaw);
   const supabase = createSupabaseServerClient();
@@ -52,58 +115,27 @@ export async function GET(request: Request) {
     .select("id,slide_count,pillar_id,template_id,job_id,jobs(template_id)")
     .eq("id", postIdRaw)
     .single();
-  if (postError || !post) {
-    return new NextResponse("post_not_found", { status: 404 });
-  }
+  if (postError || !post) return toErrorImage("post_not_found");
 
-  const { data: pillar, error: pillarError } = await supabase
+  const { data: pillar } = await supabase
     .from("pillars")
     .select("id,template_id")
     .eq("id", post.pillar_id)
     .single();
-  if (pillarError || !pillar?.template_id) {
-    return new NextResponse("pillar_not_found", { status: 404 });
-  }
 
-  const jobTemplateId = Array.isArray(post.jobs) ? post.jobs[0]?.template_id : post.jobs?.template_id;
-  const preferredTemplateId = post.template_id || jobTemplateId || pillar.template_id;
+  const jobTemplateId = Array.isArray(post.jobs) ? post.jobs[0]?.template_id : (post.jobs as any)?.template_id;
+  const preferredTemplateId = post.template_id || jobTemplateId || pillar?.template_id;
+  if (!preferredTemplateId) return toErrorImage("template_not_assigned");
 
-  let { data: template, error: templateError } = await supabase
+  const { data: template, error: templateError } = await supabase
     .from("templates")
     .select("id,format,template_pack_url,manifest_json,template_hash,status")
     .eq("id", preferredTemplateId)
     .single();
 
-  const templateMissing =
-    !!templateError ||
-    !template?.id ||
-    template.format !== "C" ||
-    !template.template_pack_url ||
-    !template.manifest_json;
-
-  if (templateMissing) {
-    const { data: fallback } = await supabase
-      .from("templates")
-      .select("id,format,template_pack_url,manifest_json,template_hash,status")
-      .eq("status", "VALID")
-      .eq("format", "C")
-      .order("created_at", { ascending: false })
-      .limit(1);
-    template = fallback?.[0] || null;
-    if (template?.id && template.id !== pillar.template_id) {
-      await supabase.from("pillars").update({ template_id: template.id }).eq("id", pillar.id);
-    }
-  }
-
-  if (!template?.id) {
-    return new NextResponse("template_not_found", { status: 404 });
-  }
-  if (template.format !== "C") {
-    return new NextResponse("template_format_not_supported", { status: 400 });
-  }
-  if (!template.template_pack_url || !template.manifest_json) {
-    return new NextResponse("template_pack_missing", { status: 400 });
-  }
+  if (templateError || !template?.id) return toErrorImage("template_not_found");
+  if (template.format !== "C") return toErrorImage("template_format_not_supported");
+  if (!template.template_pack_url || !template.manifest_json) return toErrorImage("template_pack_missing");
 
   const { data: slides } = await supabase
     .from("slides")
@@ -112,12 +144,8 @@ export async function GET(request: Request) {
     .order("slide_index", { ascending: true });
 
   const slideCount = post.slide_count || slides?.length || 0;
-  if (!slideCount) {
-    return new NextResponse("slides_missing", { status: 404 });
-  }
-  if (slideIndex > slideCount) {
-    return new NextResponse("slide_out_of_range", { status: 404 });
-  }
+  if (!slideCount) return toErrorImage("slides_missing");
+  if (slideIndex > slideCount) return toErrorImage("slide_out_of_range");
 
   const payloads = (slides || []).map((slide: any) => ({
     slide_index: slide.slide_index,
@@ -157,40 +185,11 @@ export async function GET(request: Request) {
 
   await fs.mkdir(cacheDir, { recursive: true });
 
-  const fetchTemplateZip = async (templatePackUrl: string) => {
-    const res = await fetch(templatePackUrl);
-    if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    const zip = await JSZip.loadAsync(buf);
-    const templateHash = createHash("sha256").update(buf).digest("hex");
-    return { zip, templateHash };
-  };
-
-  let zipPayload = await fetchTemplateZip(template.template_pack_url);
-  if (!zipPayload) {
-    const { data: fallback } = await supabase
-      .from("templates")
-      .select("id,format,template_pack_url,manifest_json,template_hash,status")
-      .eq("status", "VALID")
-      .eq("format", "C")
-      .order("created_at", { ascending: false })
-      .limit(1);
-    const fallbackTemplate = fallback?.[0];
-    if (!fallbackTemplate?.template_pack_url || !fallbackTemplate?.manifest_json) {
-      return new NextResponse("template_pack_fetch_failed", { status: 502 });
-    }
-    const fallbackZip = await fetchTemplateZip(fallbackTemplate.template_pack_url);
-    if (!fallbackZip) {
-      return new NextResponse("template_pack_fetch_failed", { status: 502 });
-    }
-    template = fallbackTemplate;
-    zipPayload = fallbackZip;
-    await supabase.from("posts").update({ template_id: template.id }).eq("id", post.id);
-    if (post.job_id) {
-      await supabase.from("jobs").update({ template_id: template.id }).eq("id", post.job_id);
-    }
-    await supabase.from("pillars").update({ template_id: template.id }).eq("id", pillar.id);
-  }
+  const zipPayload = await fetchTemplateZip({
+    templatePackUrl: template.template_pack_url,
+    supabase
+  });
+  if (!zipPayload) return toErrorImage("template_pack_fetch_failed");
 
   const { zip, templateHash } = zipPayload;
 
@@ -210,9 +209,7 @@ export async function GET(request: Request) {
   );
 
   const rendered = await readFileIfExists(filePath);
-  if (!rendered) {
-    return new NextResponse("render_failed", { status: 500 });
-  }
+  if (!rendered) return toErrorImage("render_failed");
 
   return new NextResponse(rendered, {
     headers: {

@@ -33,6 +33,7 @@ _Last updated: 2026-02-18_
 ### Queue / Job / Post Integration
 - [x] Assign template at job creation (UI selection + persistence).
 - [x] Posts inherit job’s `template_id`.
+- [x] Posts inherit `publish_platforms` from project platform settings.
 - [x] Queue preview resolves template via `post.template_id → job.template_id → pillar.template_id`.
 - [x] “Change template” action per job.
 
@@ -47,7 +48,11 @@ _Last updated: 2026-02-18_
 - [ ] Implement Format A/B production render pipeline in `services/renderer` (HTML/manifest → Playwright → upload assets).
 
 ### Publishing (Distribution)
-- [ ] Implement publishing step (use rendered assets to post to Instagram/TikTok or export for manual posting).
+- [x] Add `publish_jobs` queue schema (idempotency key, retries, claiming, scheduling).
+- [x] Implement publisher worker status machine (`PENDING/FAILED_RETRYABLE -> SENDING -> PUBLISHED/FAILED_*`).
+- [x] Implement Instagram publishing adapter (Graph API carousel publish, retry-aware errors).
+- [x] Add account settings UI and project-account linking for per-project credentials.
+- [ ] Implement publishing step (use rendered assets to post to TikTok or export for manual posting).
 
 ### Security / Isolation
 - [ ] Build/render Format C in a sandbox or container.
@@ -69,6 +74,9 @@ _Last updated: 2026-02-18_
 | Format C preview manifest requirement | TBD | Partially done | Enforce `manifest.json` presence for Format C (remove default manifest fallback). |
 | Production renderer (Format C) | TBD | Done | Monitor worker schedule + retries. |
 | Production renderer (Format A/B) | TBD | Not started | Implement HTML/manifest render pipeline. |
+| Publishing queue + status machine | TBD | Done | Implement platform adapters + credentials plumbing. |
+| Instagram publishing adapter | TBD | Done | Configure real IG credentials and run with `PUBLISH_DRY_RUN=false`. |
+| TikTok/manual export publishing | TBD | Not started | Implement adapters and credentials flow. |
 | Security sandboxing | TBD | Not started | Containerize builds and block network egress. |
 | Cache TTL | TBD | Not started | Add TTL/cleanup for `.cache/template-builds`. |
 | Tests | TBD | Not started | Add detection + preview + render tests. |

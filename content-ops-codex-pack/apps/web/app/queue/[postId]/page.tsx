@@ -40,7 +40,9 @@ export default async function QueuePostPreviewPage({
     .single();
   if (!pillar?.template_id) notFound();
 
-  const jobTemplateId = Array.isArray(post.jobs) ? post.jobs[0]?.template_id : post.jobs?.template_id;
+  const jobTemplateId = Array.isArray(post.jobs)
+    ? (post.jobs[0] as any)?.template_id
+    : (post.jobs as any)?.template_id;
   const preferredTemplateId = post.template_id || jobTemplateId || pillar.template_id;
 
   let { data: template } = await supabase

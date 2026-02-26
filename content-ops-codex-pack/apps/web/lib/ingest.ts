@@ -88,6 +88,18 @@ export async function ingestGoogleSheetToJob(params: {
   if (!slideIndexes.length) throw new Error("csv_missing_slide_columns");
 
   const supabase = createSupabaseServerClient();
+  const { data: projectRow, error: projectError } = await supabase
+    .from("projects")
+    .select("id,platforms_enabled")
+    .eq("id", params.projectId)
+    .single();
+  if (projectError || !projectRow?.id) {
+    throw new Error(`db_project_failed:${projectError?.message || "project_not_found"}`);
+  }
+  const projectPlatforms =
+    projectRow.platforms_enabled && typeof projectRow.platforms_enabled === "object"
+      ? projectRow.platforms_enabled
+      : { instagram: true, tiktok: false };
 
   let templateId = String(params.templateId || "").trim();
   if (templateId) {
@@ -183,7 +195,8 @@ export async function ingestGoogleSheetToJob(params: {
         ordering_index: rowIndex,
         slide_count: slideCount,
         caption,
-        hashtags
+        hashtags,
+        publish_platforms: projectPlatforms
       })
       .select("id")
       .single();

@@ -1,6 +1,7 @@
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "../../lib/supabase";
+import { enqueuePublishJobsForPostId, retryFailedPublishJobsForPostId } from "../../lib/publish-jobs";
 
 export const dynamic = "force-dynamic";
 
@@ -18,6 +19,46 @@ async function approvePost(formData: FormData) {
   redirect("/queue?approved=1");
 }
 
+async function enqueuePublishJobs(formData: FormData) {
+  "use server";
+  const postId = String(formData.get("post_id") || "").trim();
+  if (!postId) return;
+
+  let result: { created: number; skipped: number };
+  try {
+    result = await enqueuePublishJobsForPostId(postId);
+  } catch (error: any) {
+    redirect(`/queue?error=${encodeURIComponent(error?.message || "publish_enqueue_failed")}`);
+  }
+
+  revalidatePath("/queue");
+  redirect(
+    `/queue?enqueued=${encodeURIComponent(String(result.created))}&skipped=${encodeURIComponent(
+      String(result.skipped)
+    )}`
+  );
+}
+
+async function retryFailedPublishJobs(formData: FormData) {
+  "use server";
+  const postId = String(formData.get("post_id") || "").trim();
+  if (!postId) return;
+
+  let result: { retried: number; skipped: number };
+  try {
+    result = await retryFailedPublishJobsForPostId(postId);
+  } catch (error: any) {
+    redirect(`/queue?error=${encodeURIComponent(error?.message || "publish_retry_failed")}`);
+  }
+
+  revalidatePath("/queue");
+  redirect(
+    `/queue?retried=${encodeURIComponent(String(result.retried))}&retry_skipped=${encodeURIComponent(
+      String(result.skipped)
+    )}`
+  );
+}
+
 export default async function QueuePage({
   searchParams
 }: {
@@ -26,12 +67,16 @@ export default async function QueuePage({
   const params = (await searchParams) || {};
   const error = Array.isArray(params.error) ? params.error[0] : params.error;
   const approved = Array.isArray(params.approved) ? params.approved[0] : params.approved;
+  const enqueued = Array.isArray(params.enqueued) ? params.enqueued[0] : params.enqueued;
+  const skipped = Array.isArray(params.skipped) ? params.skipped[0] : params.skipped;
+  const retried = Array.isArray(params.retried) ? params.retried[0] : params.retried;
+  const retrySkipped = Array.isArray(params.retry_skipped) ? params.retry_skipped[0] : params.retry_skipped;
 
   const supabase = createSupabaseServerClient();
   const { data: posts, error: postsError } = await supabase
     .from("posts")
-    .select("id,status,ordering_index,created_at,pillar_id,pillars(name)")
-    .in("status", ["READY_FOR_REVIEW", "DRAFT", "APPROVED"])
+    .select("id,status,ordering_index,created_at,pillar_id,pillars(name),publish_jobs(status,platform)")
+    .in("status", ["READY_FOR_REVIEW", "DRAFT", "APPROVED", "RENDERED"])
     .order("created_at", { ascending: false })
     .limit(50);
 
@@ -63,11 +108,31 @@ export default async function QueuePage({
         </div>
       ) : null}
 
+      {enqueued ? (
+        <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
+          <h3>Publish jobs enqueued</h3>
+          <p>
+            Created {enqueued} publish job(s)
+            {typeof skipped !== "undefined" ? `, skipped ${skipped}` : ""}.
+          </p>
+        </div>
+      ) : null}
+
+      {retried ? (
+        <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
+          <h3>Publish jobs retried</h3>
+          <p>
+            Requeued {retried} failed publish job(s)
+            {typeof retrySkipped !== "undefined" ? `, skipped ${retrySkipped}` : ""}.
+          </p>
+        </div>
+      ) : null}
+
       {!items.length ? (
         <div className="empty">No drafts awaiting review yet. Ingest a job from Google Sheets first.</div>
       ) : (
         <div className="card">
-          <h3>Needs review</h3>
+          <h3>Queue posts</h3>
           <table className="table">
             <thead>
               <tr>
@@ -79,24 +144,47 @@ export default async function QueuePage({
               </tr>
             </thead>
             <tbody>
-              {items.map(post => (
-                <tr key={post.id}>
-                  <td>{(Array.isArray(post.pillars) ? post.pillars[0]?.name : post.pillars?.name) || post.pillar_id}</td>
-                  <td>{post.status}</td>
-                  <td>{post.ordering_index}</td>
-                  <td>
-                    <a className="chip" href={`/queue/${post.id}`}>
-                      View carousel
-                    </a>
-                  </td>
-                  <td>
-                    <form action={approvePost}>
-                      <input type="hidden" name="post_id" value={post.id} />
-                      <button type="submit">Approve</button>
-                    </form>
-                  </td>
-                </tr>
-              ))}
+              {items.map(post => {
+                const publishJobs = Array.isArray(post.publish_jobs) ? post.publish_jobs : [];
+                const hasFailedPublishJobs = publishJobs.some((job: any) =>
+                  ["FAILED_FINAL", "FAILED_RETRYABLE"].includes(String(job?.status || ""))
+                );
+
+                return (
+                  <tr key={post.id}>
+                    <td>
+                      {(Array.isArray(post.pillars) ? post.pillars[0]?.name : post.pillars?.name) || post.pillar_id}
+                    </td>
+                    <td>{post.status}</td>
+                    <td>{post.ordering_index}</td>
+                    <td>
+                      <a className="chip" href={`/queue/${post.id}`}>
+                        View carousel
+                      </a>
+                    </td>
+                    <td>
+                      {post.status === "READY_FOR_REVIEW" || post.status === "DRAFT" ? (
+                        <form action={approvePost}>
+                          <input type="hidden" name="post_id" value={post.id} />
+                          <button type="submit">Approve</button>
+                        </form>
+                      ) : post.status === "RENDERED" && hasFailedPublishJobs ? (
+                        <form action={retryFailedPublishJobs}>
+                          <input type="hidden" name="post_id" value={post.id} />
+                          <button type="submit">Retry failed publish</button>
+                        </form>
+                      ) : post.status === "RENDERED" ? (
+                        <form action={enqueuePublishJobs}>
+                          <input type="hidden" name="post_id" value={post.id} />
+                          <button type="submit">Enqueue publish</button>
+                        </form>
+                      ) : (
+                        <span className="chip">Waiting render</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

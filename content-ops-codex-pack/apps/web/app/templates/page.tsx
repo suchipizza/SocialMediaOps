@@ -91,6 +91,7 @@ async function clearPreviewCache() {
   "use server";
   const repoRoot = getRepoRoot();
   await fs.rm(path.join(repoRoot, ".cache", "queue-previews"), { recursive: true, force: true }).catch(() => {});
+  await fs.rm(path.join(repoRoot, ".cache", "template-builds"), { recursive: true, force: true }).catch(() => {});
   revalidatePath("/templates");
   redirect("/templates?cache_cleared=1");
 }
@@ -262,7 +263,7 @@ export default async function TemplatesPage({
       {cacheCleared ? (
         <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
           <h3>Preview cache cleared</h3>
-          <p>Queue previews will re-render the next time you open them.</p>
+          <p>Queue previews and template builds will be regenerated the next time they are needed.</p>
         </div>
       ) : null}
 
@@ -279,7 +280,7 @@ export default async function TemplatesPage({
       <div className="card-grid">
         <div className="card">
           <h3>Cache tools</h3>
-          <p>Clear cached queue previews so new renders are generated.</p>
+          <p>Clear local queue preview and template build caches.</p>
           <form action={clearPreviewCache}>
             <button type="submit" className="secondary">
               Clear preview cache

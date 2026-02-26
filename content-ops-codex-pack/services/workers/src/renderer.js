@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import dotenv from "dotenv";
 import { renderFormatCSlides } from "../../renderer/src/format-c.js";
+import { enqueuePublishJobsForPost } from "./lib/publish-jobs.js";
 
 function getRepoRoot() {
   const cwd = process.cwd();
@@ -18,6 +19,7 @@ const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const storageBucket = process.env.SUPABASE_STORAGE_BUCKET || "content-ops";
 const batchSize = Number.parseInt(process.env.RENDER_BATCH_SIZE || "3", 10);
+const maxBatches = Number.parseInt(process.env.RENDER_MAX_BATCHES || "0", 10);
 
 if (!supabaseUrl || !supabaseKey) {
   throw new Error("Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY");
@@ -125,6 +127,35 @@ async function renderPost(post) {
     type: "RENDER_SUCCESS",
     payload: { template_id: template.id, slide_count: slideCount }
   });
+
+  try {
+    const publishQueueResult = await enqueuePublishJobsForPost({
+      supabase,
+      post: {
+        id: post.id,
+        project_id: post.project_id,
+        job_id: post.job_id || null,
+        publish_platforms: post.publish_platforms,
+        scheduled_at: post.scheduled_at || null
+      }
+    });
+
+    await supabase.from("events_log").insert({
+      project_id: post.project_id,
+      job_id: post.job_id || null,
+      post_id: post.id,
+      type: "PUBLISH_JOBS_ENQUEUED",
+      payload: publishQueueResult
+    });
+  } catch (queueError) {
+    await supabase.from("events_log").insert({
+      project_id: post.project_id,
+      job_id: post.job_id || null,
+      post_id: post.id,
+      type: "PUBLISH_JOBS_ENQUEUE_FAILED",
+      payload: { message: String(queueError?.message || queueError) }
+    });
+  }
 }
 
 async function markFailed(post, err) {
@@ -142,27 +173,54 @@ async function markFailed(post, err) {
   });
 }
 
-async function runOnce() {
+async function processApprovedBatch() {
   const { data: posts, error } = await supabase
     .from("posts")
-    .select("id,project_id,job_id,slide_count,template_id,projects(id),jobs(template_id)")
+    .select("id,project_id,job_id,slide_count,template_id,publish_platforms,scheduled_at,projects(id),jobs(template_id)")
     .eq("status", "APPROVED")
     .order("created_at", { ascending: true })
     .limit(batchSize);
   if (error) throw new Error(`posts_fetch_failed:${error.message}`);
 
+  let rendered = 0;
+  let failed = 0;
   for (const post of posts || []) {
     try {
       await renderPost(post);
+      rendered += 1;
     } catch (err) {
       await markFailed(post, err);
+      failed += 1;
     }
   }
+
+  return { fetched: (posts || []).length, rendered, failed };
 }
 
-runOnce()
-  .then(() => {
-    console.log("Renderer worker finished.");
+async function runUntilDrained() {
+  let batches = 0;
+  let totalFetched = 0;
+  let totalRendered = 0;
+  let totalFailed = 0;
+
+  while (true) {
+    if (maxBatches > 0 && batches >= maxBatches) break;
+    const batch = await processApprovedBatch();
+    batches += 1;
+    totalFetched += batch.fetched;
+    totalRendered += batch.rendered;
+    totalFailed += batch.failed;
+    if (batch.fetched === 0) break;
+  }
+
+  return { batches, totalFetched, totalRendered, totalFailed };
+}
+
+runUntilDrained()
+  .then(summary => {
+    console.log(
+      `Renderer worker finished. batches=${summary.batches} fetched=${summary.totalFetched} rendered=${summary.totalRendered} failed=${summary.totalFailed}`
+    );
     process.exit(0);
   })
   .catch(err => {
