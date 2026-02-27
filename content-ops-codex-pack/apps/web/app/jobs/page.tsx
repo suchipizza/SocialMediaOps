@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "../../lib/supabase";
 import { ingestGoogleSheetToJob } from "../../lib/ingest";
 import { applyScheduleForJob } from "../../lib/scheduling";
+import { cleanupStalePostArtifacts } from "../../lib/cleanup";
 
 export const dynamic = "force-dynamic";
 
@@ -116,6 +117,12 @@ async function deleteJob(formData: FormData) {
   const { error } = await supabase.from("jobs").delete().eq("id", jobId);
   if (error) {
     redirect(`/jobs?error=${encodeURIComponent(error.message || "job_delete_failed")}`);
+  }
+
+  try {
+    await cleanupStalePostArtifacts({ supabase });
+  } catch {
+    // Best-effort stale artifact cleanup after successful delete.
   }
 
   revalidatePath("/jobs");
@@ -337,110 +344,112 @@ export default async function JobsPage({
           {!jobs.length ? (
             <div className="empty">No jobs yet. Create one to schedule posts.</div>
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Project</th>
-                  <th>Template</th>
-                  <th>Status</th>
-                  <th>Ingest</th>
-                  <th>Start</th>
-                  <th>Target</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((job: any) => (
-                  <tr key={job.id}>
-                    <td>
-                      {(Array.isArray(job.projects) ? job.projects[0]?.name : job.projects?.name) || job.id}
-                    </td>
-                    <td>
-                      {(Array.isArray(job.templates) ? job.templates[0]?.name : job.templates?.name) ||
-                        job.template_id ||
-                        "—"}
-                    </td>
-                    <td>{job.status}</td>
-                    <td>{job.ingest_source}</td>
-                    <td>{job.start_date}</td>
-                    <td>{job.target_post_count}</td>
-                    <td>
-                    <details>
-                      <summary className="chip" style={{ cursor: "pointer" }}>
-                        Ingest sheets
-                      </summary>
-                        <form className="form" action={ingestSheetsIntoExistingJob} style={{ marginTop: 12 }}>
-                          <input type="hidden" name="job_id" value={job.id} />
-                          <div className="field">
-                            <label htmlFor={`sheet_url_${job.id}`}>Google Sheets link</label>
-                            <input
-                              id={`sheet_url_${job.id}`}
-                              name="sheet_url"
-                              placeholder="https://docs.google.com/spreadsheets/d/…/edit#gid=0"
-                              required
-                            />
-                          </div>
-                          <button type="submit">Ingest into this job</button>
-                        </form>
-                      </details>
-                      <details style={{ marginTop: 12 }}>
-                        <summary className="chip" style={{ cursor: "pointer" }}>
-                          Change template
-                        </summary>
-                        <form className="form" action={changeJobTemplate} style={{ marginTop: 12 }}>
-                          <input type="hidden" name="job_id" value={job.id} />
-                          <div className="field">
-                            <label htmlFor={`template_id_${job.id}`}>Template</label>
-                            <select
-                              id={`template_id_${job.id}`}
-                              name="template_id"
-                              defaultValue={job.template_id || ""}
-                              required
-                            >
-                              <option value="">Select a template</option>
-                              {templates?.map(template => (
-                                <option key={template.id} value={template.id}>
-                                  {template.name} (Format {template.format})
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                          <button type="submit">Update template</button>
-                        </form>
-                      </details>
-                      <details style={{ marginTop: 12 }}>
-                        <summary className="chip" style={{ cursor: "pointer" }}>
-                          Edit schedule
-                        </summary>
-                        <form className="form" action={updateJobSettings} style={{ marginTop: 12 }}>
-                          <input type="hidden" name="job_id" value={job.id} />
-                          <div className="field">
-                            <label htmlFor={`job_start_${job.id}`}>Start date</label>
-                            <input id={`job_start_${job.id}`} name="start_date" type="date" defaultValue={job.start_date} required />
-                          </div>
-                          <div className="field">
-                            <label htmlFor={`job_target_${job.id}`}>Target posts</label>
-                            <input
-                              id={`job_target_${job.id}`}
-                              name="target_post_count"
-                              type="number"
-                              defaultValue={job.target_post_count || 21}
-                            />
-                          </div>
-                          <button type="submit">Save + resync schedule</button>
-                        </form>
-                      </details>
-                      <form action={deleteJob} style={{ marginTop: 12 }}>
-                        <input type="hidden" name="job_id" value={job.id} />
-                        <button type="submit" className="secondary">
-                          Delete job
-                        </button>
-                      </form>
-                    </td>
+            <div className="table-scroll">
+              <table className="table table-wide">
+                <thead>
+                  <tr>
+                    <th>Project</th>
+                    <th>Template</th>
+                    <th>Status</th>
+                    <th>Ingest</th>
+                    <th>Start</th>
+                    <th>Target</th>
+                    <th>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {jobs.map((job: any) => (
+                    <tr key={job.id}>
+                      <td>
+                        {(Array.isArray(job.projects) ? job.projects[0]?.name : job.projects?.name) || job.id}
+                      </td>
+                      <td>
+                        {(Array.isArray(job.templates) ? job.templates[0]?.name : job.templates?.name) ||
+                          job.template_id ||
+                          "—"}
+                      </td>
+                      <td>{job.status}</td>
+                      <td>{job.ingest_source}</td>
+                      <td>{job.start_date}</td>
+                      <td>{job.target_post_count}</td>
+                      <td>
+                        <details>
+                          <summary className="chip" style={{ cursor: "pointer" }}>
+                            Ingest sheets
+                          </summary>
+                          <form className="form" action={ingestSheetsIntoExistingJob} style={{ marginTop: 12 }}>
+                            <input type="hidden" name="job_id" value={job.id} />
+                            <div className="field">
+                              <label htmlFor={`sheet_url_${job.id}`}>Google Sheets link</label>
+                              <input
+                                id={`sheet_url_${job.id}`}
+                                name="sheet_url"
+                                placeholder="https://docs.google.com/spreadsheets/d/…/edit#gid=0"
+                                required
+                              />
+                            </div>
+                            <button type="submit">Ingest into this job</button>
+                          </form>
+                        </details>
+                        <details style={{ marginTop: 12 }}>
+                          <summary className="chip" style={{ cursor: "pointer" }}>
+                            Change template
+                          </summary>
+                          <form className="form" action={changeJobTemplate} style={{ marginTop: 12 }}>
+                            <input type="hidden" name="job_id" value={job.id} />
+                            <div className="field">
+                              <label htmlFor={`template_id_${job.id}`}>Template</label>
+                              <select
+                                id={`template_id_${job.id}`}
+                                name="template_id"
+                                defaultValue={job.template_id || ""}
+                                required
+                              >
+                                <option value="">Select a template</option>
+                                {templates?.map(template => (
+                                  <option key={template.id} value={template.id}>
+                                    {template.name} (Format {template.format})
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <button type="submit">Update template</button>
+                          </form>
+                        </details>
+                        <details style={{ marginTop: 12 }}>
+                          <summary className="chip" style={{ cursor: "pointer" }}>
+                            Edit schedule
+                          </summary>
+                          <form className="form" action={updateJobSettings} style={{ marginTop: 12 }}>
+                            <input type="hidden" name="job_id" value={job.id} />
+                            <div className="field">
+                              <label htmlFor={`job_start_${job.id}`}>Start date</label>
+                              <input id={`job_start_${job.id}`} name="start_date" type="date" defaultValue={job.start_date} required />
+                            </div>
+                            <div className="field">
+                              <label htmlFor={`job_target_${job.id}`}>Target posts</label>
+                              <input
+                                id={`job_target_${job.id}`}
+                                name="target_post_count"
+                                type="number"
+                                defaultValue={job.target_post_count || 21}
+                              />
+                            </div>
+                            <button type="submit">Save + resync schedule</button>
+                          </form>
+                        </details>
+                        <form action={deleteJob} style={{ marginTop: 12 }}>
+                          <input type="hidden" name="job_id" value={job.id} />
+                          <button type="submit" className="secondary">
+                            Delete job
+                          </button>
+                        </form>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>

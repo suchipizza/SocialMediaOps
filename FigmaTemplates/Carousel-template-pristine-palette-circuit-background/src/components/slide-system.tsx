@@ -273,11 +273,12 @@ export const CTALayout: React.FC<{ text: string }> = ({ text }) => {
           boxShadow: '0 50px 100px -20px rgba(15, 23, 42, 0.1)',
         }}
       >
-        <div className="w-[600px]">
+        <div style={{ width: '210px' }}>
           <ImageWithFallback 
             src={logoImg} 
             alt="Us.v2 Logo" 
-            className="w-full h-auto object-contain"
+            className="h-auto object-contain"
+            style={{ width: '210px' }}
           />
         </div>
       </div>
@@ -314,7 +315,7 @@ export const CTALayout: React.FC<{ text: string }> = ({ text }) => {
                 boxShadow: '0 20px 40px -10px rgba(255, 0, 127, 0.3)'
               }}
             >
-              Join the Movement
+          
             </div>
           </div>
         </div>

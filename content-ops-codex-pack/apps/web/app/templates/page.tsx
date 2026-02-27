@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { createSupabaseServerClient, getSupabaseStorageBucket } from "../../lib/supabase";
 import { createTemplateFromZip } from "../../lib/templates";
+import { cleanupStalePostArtifacts } from "../../lib/cleanup";
 
 function normalizeErrorMessage(input: unknown) {
   const raw = String(input || "upload_failed");
@@ -199,6 +200,12 @@ async function deleteTemplate(formData: FormData) {
   }
   await removeQueuePreviewCache((affectedPosts || []).map(post => post.id));
 
+  try {
+    await cleanupStalePostArtifacts({ supabase });
+  } catch {
+    // Best-effort stale artifact cleanup after successful delete.
+  }
+
   revalidatePath("/templates");
   redirect("/templates?deleted=1");
 }
@@ -315,49 +322,51 @@ export default async function TemplatesPage({
           {!templates?.length ? (
             <div className="empty">No templates yet. Upload your first pack.</div>
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Platform</th>
-                  <th>Format</th>
-                  <th>Status</th>
-                  <th>Slides</th>
-                  <th>Preview</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {templates.map(template => (
-                  <tr key={template.id}>
-                    <td>{template.name}</td>
-                    <td>{template.platform_scope}</td>
-                    <td>{template.format || template.manifest_json?.template_format || "A/B"}</td>
-                    <td>{template.status || "UNKNOWN"}</td>
-                    <td>{template.manifest_json?.slide_count ?? "-"}</td>
-                    <td>
-                      {template.preview_assets?.length ? (
-                        <a className="chip" href={`/templates/${template.id}`}>
-                          View preview
-                        </a>
-                      ) : template.status === "INVALID_RENDER" ? (
-                        <span className="chip">Invalid</span>
-                      ) : (
-                        <span className="chip">Pending</span>
-                      )}
-                    </td>
-                    <td>
-                      <form action={deleteTemplate}>
-                        <input type="hidden" name="template_id" value={template.id} />
-                        <button type="submit" className="secondary">
-                          Delete
-                        </button>
-                      </form>
-                    </td>
+            <div className="table-scroll">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Platform</th>
+                    <th>Format</th>
+                    <th>Status</th>
+                    <th>Slides</th>
+                    <th>Preview</th>
+                    <th>Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {templates.map(template => (
+                    <tr key={template.id}>
+                      <td>{template.name}</td>
+                      <td>{template.platform_scope}</td>
+                      <td>{template.format || template.manifest_json?.template_format || "A/B"}</td>
+                      <td>{template.status || "UNKNOWN"}</td>
+                      <td>{template.manifest_json?.slide_count ?? "-"}</td>
+                      <td>
+                        {template.preview_assets?.length ? (
+                          <a className="chip" href={`/templates/${template.id}`}>
+                            View preview
+                          </a>
+                        ) : template.status === "INVALID_RENDER" ? (
+                          <span className="chip">Invalid</span>
+                        ) : (
+                          <span className="chip">Pending</span>
+                        )}
+                      </td>
+                      <td>
+                        <form action={deleteTemplate}>
+                          <input type="hidden" name="template_id" value={template.id} />
+                          <button type="submit" className="secondary">
+                            Delete
+                          </button>
+                        </form>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>

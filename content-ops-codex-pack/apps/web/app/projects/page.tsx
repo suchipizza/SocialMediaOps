@@ -4,6 +4,7 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { createSupabaseServerClient, getSupabaseStorageBucket } from "../../lib/supabase";
 import { applyScheduleForProjectJobs } from "../../lib/scheduling";
+import { cleanupStalePostArtifacts } from "../../lib/cleanup";
 
 function normalizeAccountId(value: FormDataEntryValue | null) {
   const parsed = String(value || "").trim();
@@ -388,6 +389,12 @@ async function deleteProject(formData: FormData) {
     redirect(`/projects?error=${encodeURIComponent(error.message || "project_delete_failed")}`);
   }
 
+  try {
+    await cleanupStalePostArtifacts({ supabase });
+  } catch {
+    // Best-effort stale artifact cleanup after successful delete.
+  }
+
   revalidatePath("/projects");
   revalidatePath("/queue");
   revalidatePath("/jobs");
@@ -610,39 +617,41 @@ export default async function ProjectsPage({
           {!accounts?.length ? (
             <div className="empty">No accounts stored yet.</div>
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Platform</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {accounts.map((account: any) => (
-                  <tr key={account.id}>
-                    <td>{account.name}</td>
-                    <td>{account.platform}</td>
-                    <td>
-                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        {account.platform === "instagram" ? (
-                          <form action={testInstagramAccountCredentials}>
-                            <input type="hidden" name="account_id" value={account.id} />
-                            <button type="submit">Test credentials</button>
-                          </form>
-                        ) : null}
-                        <form action={deleteSocialAccount}>
-                          <input type="hidden" name="account_id" value={account.id} />
-                          <button type="submit" className="secondary">
-                            Delete
-                          </button>
-                        </form>
-                      </div>
-                    </td>
+            <div className="table-scroll">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Platform</th>
+                    <th>Action</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {accounts.map((account: any) => (
+                    <tr key={account.id}>
+                      <td>{account.name}</td>
+                      <td>{account.platform}</td>
+                      <td>
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                          {account.platform === "instagram" ? (
+                            <form action={testInstagramAccountCredentials}>
+                              <input type="hidden" name="account_id" value={account.id} />
+                              <button type="submit">Test credentials</button>
+                            </form>
+                          ) : null}
+                          <form action={deleteSocialAccount}>
+                            <input type="hidden" name="account_id" value={account.id} />
+                            <button type="submit" className="secondary">
+                              Delete
+                            </button>
+                          </form>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
 
@@ -651,135 +660,137 @@ export default async function ProjectsPage({
           {!projects?.length ? (
             <div className="empty">No projects yet. Create your first above.</div>
           ) : (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Timezone</th>
-                  <th>Slots</th>
-                  <th>Linked accounts</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {projects.map((project: any) => {
-                  const linked = linkMap.get(project.id) || { labels: [] };
-                  const enabled = project.platforms_enabled || {};
-                  return (
-                    <tr key={project.id}>
-                      <td>{project.name}</td>
-                      <td>{project.timezone}</td>
-                      <td>{(project.slot_times || []).join(", ")}</td>
-                      <td>{linked.labels.length ? linked.labels.join(", ") : "—"}</td>
-                      <td>
-                        <details>
-                          <summary className="chip" style={{ cursor: "pointer" }}>
-                            Edit settings
-                          </summary>
-                          <form className="form" action={updateProjectSettings} style={{ marginTop: 12 }}>
-                            <input type="hidden" name="project_id" value={project.id} />
-                            <div className="field">
-                              <label htmlFor={`project_name_${project.id}`}>Project name</label>
-                              <input
-                                id={`project_name_${project.id}`}
-                                name="name"
-                                defaultValue={project.name || ""}
-                                required
-                              />
-                            </div>
-                            <div className="field">
-                              <label htmlFor={`project_description_${project.id}`}>Description</label>
-                              <textarea
-                                id={`project_description_${project.id}`}
-                                name="description"
-                                defaultValue={project.description || ""}
-                                rows={3}
-                              />
-                            </div>
-                            <div className="field">
-                              <label htmlFor={`project_timezone_${project.id}`}>Timezone</label>
-                              <input
-                                id={`project_timezone_${project.id}`}
-                                name="timezone"
-                                defaultValue={project.timezone || "Europe/Zurich"}
-                              />
-                            </div>
-                            <div className="field">
-                              <label htmlFor={`project_slots_${project.id}`}>Daily slots (comma separated)</label>
-                              <input
-                                id={`project_slots_${project.id}`}
-                                name="slot_times"
-                                defaultValue={(project.slot_times || []).join(", ") || "09:00,13:00,18:00"}
-                              />
-                            </div>
-                            <button type="submit">Save settings</button>
-                          </form>
-                        </details>
-                        <details>
-                          <summary className="chip" style={{ cursor: "pointer" }}>
-                            Link accounts
-                          </summary>
-                          <form className="form" action={updateProjectAccounts} style={{ marginTop: 12 }}>
-                            <input type="hidden" name="project_id" value={project.id} />
-                            <div className="field">
-                              <label>
+            <div className="table-scroll">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Timezone</th>
+                    <th>Slots</th>
+                    <th>Linked accounts</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {projects.map((project: any) => {
+                    const linked = linkMap.get(project.id) || { labels: [] };
+                    const enabled = project.platforms_enabled || {};
+                    return (
+                      <tr key={project.id}>
+                        <td>{project.name}</td>
+                        <td>{project.timezone}</td>
+                        <td>{(project.slot_times || []).join(", ")}</td>
+                        <td>{linked.labels.length ? linked.labels.join(", ") : "—"}</td>
+                        <td>
+                          <details>
+                            <summary className="chip" style={{ cursor: "pointer" }}>
+                              Edit settings
+                            </summary>
+                            <form className="form" action={updateProjectSettings} style={{ marginTop: 12 }}>
+                              <input type="hidden" name="project_id" value={project.id} />
+                              <div className="field">
+                                <label htmlFor={`project_name_${project.id}`}>Project name</label>
                                 <input
-                                  type="checkbox"
-                                  name="platform_instagram"
-                                  defaultChecked={enabled.instagram !== false}
-                                />{" "}
-                                Post to Instagram
-                              </label>
-                              <label>
-                                <input type="checkbox" name="platform_tiktok" defaultChecked={enabled.tiktok === true} />{" "}
-                                Post to TikTok
-                              </label>
-                            </div>
-                            <div className="field">
-                              <label htmlFor={`instagram_account_id_${project.id}`}>Instagram account</label>
-                              <select
-                                id={`instagram_account_id_${project.id}`}
-                                name="instagram_account_id"
-                                defaultValue={linked.instagram || ""}
-                              >
-                                <option value="">No linked account</option>
-                                {instagramAccounts.map((account: any) => (
-                                  <option key={account.id} value={account.id}>
-                                    {account.name}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <div className="field">
-                              <label htmlFor={`tiktok_account_id_${project.id}`}>TikTok account</label>
-                              <select
-                                id={`tiktok_account_id_${project.id}`}
-                                name="tiktok_account_id"
-                                defaultValue={linked.tiktok || ""}
-                              >
-                                <option value="">No linked account</option>
-                                {tiktokAccounts.map((account: any) => (
-                                  <option key={account.id} value={account.id}>
-                                    {account.name}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <button type="submit">Save account links</button>
+                                  id={`project_name_${project.id}`}
+                                  name="name"
+                                  defaultValue={project.name || ""}
+                                  required
+                                />
+                              </div>
+                              <div className="field">
+                                <label htmlFor={`project_description_${project.id}`}>Description</label>
+                                <textarea
+                                  id={`project_description_${project.id}`}
+                                  name="description"
+                                  defaultValue={project.description || ""}
+                                  rows={3}
+                                />
+                              </div>
+                              <div className="field">
+                                <label htmlFor={`project_timezone_${project.id}`}>Timezone</label>
+                                <input
+                                  id={`project_timezone_${project.id}`}
+                                  name="timezone"
+                                  defaultValue={project.timezone || "Europe/Zurich"}
+                                />
+                              </div>
+                              <div className="field">
+                                <label htmlFor={`project_slots_${project.id}`}>Daily slots (comma separated)</label>
+                                <input
+                                  id={`project_slots_${project.id}`}
+                                  name="slot_times"
+                                  defaultValue={(project.slot_times || []).join(", ") || "09:00,13:00,18:00"}
+                                />
+                              </div>
+                              <button type="submit">Save settings</button>
+                            </form>
+                          </details>
+                          <details>
+                            <summary className="chip" style={{ cursor: "pointer" }}>
+                              Link accounts
+                            </summary>
+                            <form className="form" action={updateProjectAccounts} style={{ marginTop: 12 }}>
+                              <input type="hidden" name="project_id" value={project.id} />
+                              <div className="field">
+                                <label>
+                                  <input
+                                    type="checkbox"
+                                    name="platform_instagram"
+                                    defaultChecked={enabled.instagram !== false}
+                                  />{" "}
+                                  Post to Instagram
+                                </label>
+                                <label>
+                                  <input type="checkbox" name="platform_tiktok" defaultChecked={enabled.tiktok === true} />{" "}
+                                  Post to TikTok
+                                </label>
+                              </div>
+                              <div className="field">
+                                <label htmlFor={`instagram_account_id_${project.id}`}>Instagram account</label>
+                                <select
+                                  id={`instagram_account_id_${project.id}`}
+                                  name="instagram_account_id"
+                                  defaultValue={linked.instagram || ""}
+                                >
+                                  <option value="">No linked account</option>
+                                  {instagramAccounts.map((account: any) => (
+                                    <option key={account.id} value={account.id}>
+                                      {account.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <div className="field">
+                                <label htmlFor={`tiktok_account_id_${project.id}`}>TikTok account</label>
+                                <select
+                                  id={`tiktok_account_id_${project.id}`}
+                                  name="tiktok_account_id"
+                                  defaultValue={linked.tiktok || ""}
+                                >
+                                  <option value="">No linked account</option>
+                                  {tiktokAccounts.map((account: any) => (
+                                    <option key={account.id} value={account.id}>
+                                      {account.name}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                              <button type="submit">Save account links</button>
+                            </form>
+                          </details>
+                          <form action={deleteProject} style={{ marginTop: 12 }}>
+                            <input type="hidden" name="project_id" value={project.id} />
+                            <button type="submit" className="secondary">
+                              Delete
+                            </button>
                           </form>
-                        </details>
-                        <form action={deleteProject} style={{ marginTop: 12 }}>
-                          <input type="hidden" name="project_id" value={project.id} />
-                          <button type="submit" className="secondary">
-                            Delete
-                          </button>
-                        </form>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>

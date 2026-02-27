@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 import { createSupabaseServerClient } from "../../lib/supabase";
 import { enqueuePublishJobsForPostId, retryFailedPublishJobsForPostId } from "../../lib/publish-jobs";
+import { triggerRendererThenPublisher } from "../../lib/workers";
 
 export const dynamic = "force-dynamic";
 
@@ -15,8 +16,25 @@ async function approvePost(formData: FormData) {
   if (error) {
     redirect(`/queue?error=${encodeURIComponent(error.message)}`);
   }
+
+  let triggerQuery = "";
+  const triggerResult = await triggerRendererThenPublisher();
+  if (triggerResult.triggered) {
+    triggerQuery = "&workers_triggered=1";
+  } else if (triggerResult.reason === "already_running") {
+    triggerQuery = "&workers_triggered=0&workers_reason=already_running";
+  } else if (triggerResult.reason === "disabled") {
+    triggerQuery = "&workers_triggered=0&workers_reason=disabled";
+  } else if (triggerResult.reason === "spawn_failed") {
+    triggerQuery = `&workers_triggered=0&workers_reason=${encodeURIComponent(
+      triggerResult.message || "spawn_failed"
+    )}`;
+  } else {
+    triggerQuery = "&workers_triggered=0&workers_reason=unknown";
+  }
+
   revalidatePath("/queue");
-  redirect("/queue?approved=1");
+  redirect(`/queue?approved=1${triggerQuery}`);
 }
 
 async function enqueuePublishJobs(formData: FormData) {
@@ -71,6 +89,8 @@ export default async function QueuePage({
   const skipped = Array.isArray(params.skipped) ? params.skipped[0] : params.skipped;
   const retried = Array.isArray(params.retried) ? params.retried[0] : params.retried;
   const retrySkipped = Array.isArray(params.retry_skipped) ? params.retry_skipped[0] : params.retry_skipped;
+  const workersTriggered = Array.isArray(params.workers_triggered) ? params.workers_triggered[0] : params.workers_triggered;
+  const workersReason = Array.isArray(params.workers_reason) ? params.workers_reason[0] : params.workers_reason;
 
   const supabase = createSupabaseServerClient();
   const { data: posts, error: postsError } = await supabase
@@ -104,7 +124,18 @@ export default async function QueuePage({
       {approved ? (
         <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
           <h3>Approved</h3>
-          <p>Post moved to APPROVED. Next step is rendering + scheduling.</p>
+          <p>
+            Post moved to APPROVED.
+            {workersTriggered === "1"
+              ? " Renderer + publisher were triggered in background."
+              : workersReason === "already_running"
+                ? " Renderer/publisher already running in background."
+                : workersReason === "disabled"
+                  ? " Worker auto-trigger is disabled on this environment."
+                  : workersReason
+                    ? ` Worker trigger failed: ${workersReason}.`
+                    : " Next step is rendering + scheduling."}
+          </p>
         </div>
       ) : null}
 
@@ -146,8 +177,13 @@ export default async function QueuePage({
             <tbody>
               {items.map(post => {
                 const publishJobs = Array.isArray(post.publish_jobs) ? post.publish_jobs : [];
+                const publishStatuses = publishJobs.map((job: any) => String(job?.status || ""));
                 const hasFailedPublishJobs = publishJobs.some((job: any) =>
                   ["FAILED_FINAL", "FAILED_RETRYABLE"].includes(String(job?.status || ""))
+                );
+                const hasPublishedPublishJobs = publishStatuses.includes("PUBLISHED");
+                const hasPendingOrSendingPublishJobs = publishStatuses.some(status =>
+                  ["PENDING", "SENDING", "FAILED_RETRYABLE"].includes(status)
                 );
 
                 return (
@@ -173,10 +209,14 @@ export default async function QueuePage({
                           <input type="hidden" name="post_id" value={post.id} />
                           <button type="submit">Retry failed publish</button>
                         </form>
+                      ) : post.status === "RENDERED" && hasPublishedPublishJobs && !hasPendingOrSendingPublishJobs ? (
+                        <span className="chip">Published</span>
+                      ) : post.status === "RENDERED" && hasPendingOrSendingPublishJobs ? (
+                        <span className="chip">Publishing queued</span>
                       ) : post.status === "RENDERED" ? (
                         <form action={enqueuePublishJobs}>
                           <input type="hidden" name="post_id" value={post.id} />
-                          <button type="submit">Enqueue publish</button>
+                          <button type="submit">Ready to publish</button>
                         </form>
                       ) : (
                         <span className="chip">Waiting render</span>

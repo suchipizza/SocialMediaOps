@@ -25,6 +25,7 @@ body {
   font-family: var(--font-body);
   color: var(--text);
   background: radial-gradient(circle at top, var(--bg-accent) 0%, var(--bg) 55%);
+  overflow: hidden;
 }
 
 a {
@@ -46,12 +47,15 @@ p {
 }
 
 .app-shell {
-  display: flex;
   min-height: 100vh;
 }
 
 .sidebar {
   width: 280px;
+  position: fixed;
+  inset: 0 auto 0 0;
+  height: 100vh;
+  overflow-y: auto;
   padding: 28px 22px;
   background: linear-gradient(180deg, #fff1dc 0%, #f8dcc0 100%);
   border-right: 1px solid var(--border);
@@ -99,8 +103,13 @@ p {
 }
 
 .main {
-  flex: 1;
+  margin-left: 280px;
+  height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
   padding: 32px 40px 64px;
+  -webkit-overflow-scrolling: touch;
 }
 
 .page-header {
@@ -121,12 +130,18 @@ p {
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
 }
 
+.card-grid > * {
+  min-width: 0;
+}
+
 .card {
   background: var(--panel-strong);
   border-radius: var(--radius);
   padding: 18px;
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
+  min-width: 0;
+  overflow: hidden;
 }
 
 .card h3 {
@@ -169,6 +184,8 @@ textarea {
   border: 1px solid var(--border);
   padding: 10px 12px;
   background: #fff;
+  width: 100%;
+  min-width: 0;
 }
 
 button {
@@ -180,6 +197,9 @@ button {
   color: #fff;
   font-weight: 700;
   cursor: pointer;
+  max-width: 100%;
+  white-space: normal;
+  line-height: 1.2;
 }
 
 button.secondary {
@@ -190,6 +210,11 @@ button.secondary {
 .table {
   width: 100%;
   border-collapse: collapse;
+  min-width: 640px;
+}
+
+.table-wide {
+  min-width: 980px;
 }
 
 .table th,
@@ -198,6 +223,17 @@ button.secondary {
   padding: 10px 6px;
   border-bottom: 1px solid var(--border);
   font-size: 0.92rem;
+  vertical-align: top;
+}
+
+.table td {
+  overflow-wrap: anywhere;
+}
+
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .empty {
@@ -209,11 +245,19 @@ button.secondary {
 }
 
 @media (max-width: 900px) {
+  body {
+    overflow: auto;
+  }
+
   .app-shell {
     flex-direction: column;
   }
 
   .sidebar {
+    position: static;
+    inset: auto;
+    height: auto;
+    overflow: visible;
     width: 100%;
     flex-direction: row;
     align-items: center;
@@ -227,6 +271,13 @@ button.secondary {
   }
 
   .main {
+    margin-left: 0;
+    height: auto;
+    overflow: visible;
     padding: 24px;
+  }
+
+  .table {
+    min-width: 560px;
   }
 }

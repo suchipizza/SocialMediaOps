@@ -1,6 +1,6 @@
 # PRD Task Checklist — Format C + Template Preview
 
-_Last updated: 2026-02-18_
+_Last updated: 2026-02-27_
 
 ## Checklist
 
@@ -54,6 +54,44 @@ _Last updated: 2026-02-18_
 - [x] Add account settings UI and project-account linking for per-project credentials.
 - [ ] Implement publishing step (use rendered assets to post to TikTok or export for manual posting).
 
+### Deployment Architecture Proposal (Vercel + Fly + Supabase)
+- [ ] Add worker control queue schema (`worker_control_jobs`) for UI-triggered renderer/publisher runs (no direct process spawn from web).
+- [ ] Refactor workers into reusable runners (`runRendererUntilDrained`, `runPublisherOnce`, `runPublisherLoop`) plus thin CLI wrappers.
+- [ ] Add Fly worker supervisor process that:
+  - polls control queue,
+  - runs requested jobs,
+  - writes structured run results/logs to DB,
+  - keeps renderer/publisher schedule loops active.
+- [ ] Add `/operations` UI on web app to:
+  - trigger control jobs (`Run renderer now`, `Run publisher now`),
+  - show worker heartbeat,
+  - show recent run history + error summaries.
+- [ ] Add worker heartbeat + liveness model (`worker_heartbeats` table or equivalent) with stale-worker detection.
+- [ ] Add idempotency and concurrency guards:
+  - one active render worker per queue partition,
+  - safe claim/reclaim for stuck jobs,
+  - dedupe on control job idempotency keys.
+- [ ] Add robust retry/backoff policy config:
+  - renderer retries only on transient failures,
+  - publisher retry windows + max attempts + dead-letter status.
+- [ ] Add structured observability:
+  - per-run correlation IDs,
+  - logs persisted to DB and emitted to Fly logs,
+  - alert thresholds for repeated failures.
+- [ ] Add secrets strategy:
+  - keep Supabase + platform secrets in Fly secrets/Vercel env,
+  - remove reliance on local `.env` for production execution.
+- [ ] Add deployment runbook:
+  - Fly process model (`web` optional, `worker` required),
+  - rollout procedure,
+  - rollback and incident checklist.
+
+### Scheduling + Operations Hardening
+- [ ] Run publisher continuously on Fly (short poll interval) so scheduled posts publish without manual terminal commands.
+- [ ] Keep renderer in drain mode on schedule or control trigger; avoid long idle loops that hide failures.
+- [ ] Add explicit "requeue failed publish jobs" bulk action in UI with audit event.
+- [ ] Add timezone/schedule validation in UI with explicit UTC preview before saving project/job settings.
+
 ### Security / Isolation
 - [ ] Build/render Format C in a sandbox or container.
 - [ ] Disable network egress during build/render where feasible.
@@ -80,3 +118,6 @@ _Last updated: 2026-02-18_
 | Security sandboxing | TBD | Not started | Containerize builds and block network egress. |
 | Cache TTL | TBD | Not started | Add TTL/cleanup for `.cache/template-builds`. |
 | Tests | TBD | Not started | Add detection + preview + render tests. |
+| Deployment architecture (Vercel + Fly) | TBD | Proposed | Add worker control queue + Fly supervisor + `/operations` UI control panel. |
+| Worker observability and heartbeat | TBD | Not started | Add heartbeats, run history, and stale-worker alerts. |
+| Scheduling reliability (always-on publisher) | TBD | Not started | Run publisher continuously on Fly with retry/backoff monitoring. |
