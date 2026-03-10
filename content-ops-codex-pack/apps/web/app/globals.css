@@ -70,6 +70,43 @@ p {
   font-weight: 700;
 }
 
+.sidebar-heartbeat {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+
+.sidebar-heartbeat-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.sidebar-heartbeat--ok {
+  background: #e8f6e8;
+  color: #1f6e1f;
+  border-color: rgba(31, 110, 31, 0.2);
+}
+
+.sidebar-heartbeat--warn {
+  background: #ffe6cf;
+  color: #a94400;
+  border-color: rgba(169, 68, 0, 0.2);
+}
+
+.sidebar-heartbeat--muted {
+  background: rgba(255, 255, 255, 0.65);
+  color: #6a5f56;
+  border-color: rgba(106, 95, 86, 0.2);
+}
+
 .nav {
   display: grid;
   gap: 10px;

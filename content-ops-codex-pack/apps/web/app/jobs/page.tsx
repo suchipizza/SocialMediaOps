@@ -4,6 +4,7 @@ import { createSupabaseServerClient } from "../../lib/supabase";
 import { ingestGoogleSheetToJob } from "../../lib/ingest";
 import { applyScheduleForJob } from "../../lib/scheduling";
 import { cleanupStalePostArtifacts } from "../../lib/cleanup";
+import { SheetValidator } from "./sheet-validator";
 
 export const dynamic = "force-dynamic";
 
@@ -51,7 +52,7 @@ async function createJob(formData: FormData) {
       revalidatePath("/jobs");
       revalidatePath("/queue");
       redirect(
-        `/jobs?ingested=1&created_posts=${result.createdPosts}&created_pillars=${result.createdPillars}&skipped_rows=${result.skippedRows}`
+        `/jobs?ingested=1&created_posts=${result.createdPosts}&created_pillars=${result.createdPillars}&skipped_rows=${result.skippedRows}&invalid_json_rows=${result.invalidJsonRows}&cleaned_orphan_posts=${result.cleanedOrphanPosts}&replaced_existing_posts=${result.replacedExistingPosts}`
       );
     } catch (err: any) {
       if (err?.digest?.startsWith("NEXT_REDIRECT")) {
@@ -92,7 +93,7 @@ async function ingestSheetsIntoExistingJob(formData: FormData) {
     revalidatePath("/jobs");
     revalidatePath("/queue");
     redirect(
-      `/jobs?ingested=1&created_posts=${result.createdPosts}&created_pillars=${result.createdPillars}&skipped_rows=${result.skippedRows}`
+      `/jobs?ingested=1&created_posts=${result.createdPosts}&created_pillars=${result.createdPillars}&skipped_rows=${result.skippedRows}&invalid_json_rows=${result.invalidJsonRows}&cleaned_orphan_posts=${result.cleanedOrphanPosts}&replaced_existing_posts=${result.replacedExistingPosts}`
     );
   } catch (err: any) {
     if (err?.digest?.startsWith("NEXT_REDIRECT")) {
@@ -127,6 +128,87 @@ async function deleteJob(formData: FormData) {
 
   revalidatePath("/jobs");
   redirect("/jobs?deleted=1");
+}
+
+async function stopJob(formData: FormData) {
+  "use server";
+  const jobId = String(formData.get("job_id") || "").trim();
+  if (!jobId) return;
+
+  const supabase = createSupabaseServerClient();
+  const { data: job, error: jobError } = await supabase
+    .from("jobs")
+    .select("id,project_id,status")
+    .eq("id", jobId)
+    .single();
+  if (jobError || !job?.id || !job?.project_id) {
+    redirect(`/jobs?error=${encodeURIComponent(jobError?.message || "job_not_found")}`);
+  }
+
+  if (job.status === "STOPPED") {
+    revalidatePath("/jobs");
+    revalidatePath("/queue");
+    redirect("/jobs?stopped=1&cancelled_publish_jobs=0");
+  }
+
+  const { error: stopError } = await supabase.from("jobs").update({ status: "STOPPED" }).eq("id", jobId);
+  if (stopError) {
+    redirect(`/jobs?error=${encodeURIComponent(stopError.message || "job_stop_failed")}`);
+  }
+
+  const { data: postRows, error: postRowsError } = await supabase.from("posts").select("id").eq("job_id", jobId);
+  if (postRowsError) {
+    redirect(`/jobs?error=${encodeURIComponent(postRowsError.message || "job_stop_posts_lookup_failed")}`);
+  }
+
+  const postIds = (postRows || []).map((row: any) => row.id).filter(Boolean);
+  let cancelledPublishJobs = 0;
+  if (postIds.length) {
+    const cancellableStatuses = ["PENDING", "SENDING", "FAILED_RETRYABLE"];
+    const { data: publishRows, error: publishRowsError } = await supabase
+      .from("publish_jobs")
+      .select("id")
+      .in("post_id", postIds)
+      .in("status", cancellableStatuses);
+    if (publishRowsError) {
+      redirect(`/jobs?error=${encodeURIComponent(publishRowsError.message || "job_stop_publish_lookup_failed")}`);
+    }
+
+    const publishIds = (publishRows || []).map((row: any) => row.id).filter(Boolean);
+    cancelledPublishJobs = publishIds.length;
+    if (publishIds.length) {
+      const { error: cancelError } = await supabase
+        .from("publish_jobs")
+        .update({
+          status: "CANCELLED",
+          completed_at: new Date().toISOString(),
+          claimed_at: null,
+          claimed_by: null,
+          next_retry_at: null
+        })
+        .in("id", publishIds);
+      if (cancelError) {
+        redirect(`/jobs?error=${encodeURIComponent(cancelError.message || "job_stop_publish_cancel_failed")}`);
+      }
+    }
+  }
+
+  const { error: eventError } = await supabase.from("events_log").insert({
+    project_id: job.project_id,
+    job_id: jobId,
+    type: "JOB_STOPPED",
+    payload: {
+      cancelled_publish_jobs: cancelledPublishJobs,
+      previous_status: job.status
+    }
+  });
+  if (eventError) {
+    redirect(`/jobs?error=${encodeURIComponent(eventError.message || "job_stop_event_failed")}`);
+  }
+
+  revalidatePath("/jobs");
+  revalidatePath("/queue");
+  redirect(`/jobs?stopped=1&cancelled_publish_jobs=${cancelledPublishJobs}`);
 }
 
 async function changeJobTemplate(formData: FormData) {
@@ -205,9 +287,20 @@ export default async function JobsPage({
     ? params.template_changed[0]
     : params.template_changed;
   const settingsUpdated = Array.isArray(params.settings_updated) ? params.settings_updated[0] : params.settings_updated;
+  const stopped = Array.isArray(params.stopped) ? params.stopped[0] : params.stopped;
+  const cancelledPublishJobs = Array.isArray(params.cancelled_publish_jobs)
+    ? params.cancelled_publish_jobs[0]
+    : params.cancelled_publish_jobs;
   const createdPosts = Array.isArray(params.created_posts) ? params.created_posts[0] : params.created_posts;
   const createdPillars = Array.isArray(params.created_pillars) ? params.created_pillars[0] : params.created_pillars;
   const skippedRows = Array.isArray(params.skipped_rows) ? params.skipped_rows[0] : params.skipped_rows;
+  const invalidJsonRows = Array.isArray(params.invalid_json_rows) ? params.invalid_json_rows[0] : params.invalid_json_rows;
+  const cleanedOrphanPosts = Array.isArray(params.cleaned_orphan_posts)
+    ? params.cleaned_orphan_posts[0]
+    : params.cleaned_orphan_posts;
+  const replacedExistingPosts = Array.isArray(params.replaced_existing_posts)
+    ? params.replaced_existing_posts[0]
+    : params.replaced_existing_posts;
 
   const supabase = createSupabaseServerClient();
   const { data: projectsData } = await supabase
@@ -259,6 +352,9 @@ export default async function JobsPage({
           <p>
             Created {createdPosts || "0"} posts, created {createdPillars || "0"} pillars, skipped{" "}
             {skippedRows || "0"} rows.
+            {invalidJsonRows ? ` ${invalidJsonRows} row(s) had invalid slide JSON and were auto-repaired.` : ""}
+            {cleanedOrphanPosts ? ` Cleaned ${cleanedOrphanPosts} broken post(s) with missing slides.` : ""}
+            {replacedExistingPosts ? ` Replaced ${replacedExistingPosts} pre-existing post(s) in this job.` : ""}
           </p>
         </div>
       ) : null}
@@ -281,6 +377,15 @@ export default async function JobsPage({
         <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
           <h3>Job settings updated</h3>
           <p>Start date/target were saved and post publish timestamps were resynced from project slots.</p>
+        </div>
+      ) : null}
+
+      {stopped ? (
+        <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
+          <h3>Job stopped</h3>
+          <p>
+            Publishing was cancelled for this job. Cancelled {cancelledPublishJobs || "0"} active publish job(s).
+          </p>
         </div>
       ) : null}
 
@@ -337,6 +442,7 @@ export default async function JobsPage({
             </div>
             <button type="submit">Create job</button>
           </form>
+          <SheetValidator />
         </div>
 
         <div className="card">
@@ -444,6 +550,18 @@ export default async function JobsPage({
                             Delete job
                           </button>
                         </form>
+                        {job.status !== "STOPPED" ? (
+                          <form action={stopJob} style={{ marginTop: 12 }}>
+                            <input type="hidden" name="job_id" value={job.id} />
+                            <button type="submit" className="secondary">
+                              Stop job
+                            </button>
+                          </form>
+                        ) : (
+                          <div style={{ marginTop: 12 }}>
+                            <span className="chip">Stopped</span>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   ))}

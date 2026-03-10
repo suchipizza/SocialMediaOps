@@ -6,6 +6,32 @@ import { triggerRendererThenPublisher } from "../../lib/workers";
 
 export const dynamic = "force-dynamic";
 
+function formatScheduledAt(value: string | null | undefined, timezone?: string | null) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const utcText = `${date.toISOString().slice(0, 16).replace("T", " ")} UTC`;
+  const zone = String(timezone || "").trim();
+  if (!zone || zone.toUpperCase() === "UTC") return utcText;
+
+  try {
+    const localText = new Intl.DateTimeFormat("en-GB", {
+      timeZone: zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23"
+    })
+      .format(date)
+      .replace(",", "");
+    return `${localText} ${zone} (${utcText})`;
+  } catch {
+    return utcText;
+  }
+}
+
 async function approvePost(formData: FormData) {
   "use server";
   const postId = String(formData.get("post_id") || "").trim();
@@ -95,9 +121,13 @@ export default async function QueuePage({
   const supabase = createSupabaseServerClient();
   const { data: posts, error: postsError } = await supabase
     .from("posts")
-    .select("id,status,ordering_index,created_at,pillar_id,pillars(name),publish_jobs(status,platform)")
+    .select(
+      "id,status,ordering_index,scheduled_at,created_at,pillar_id,pillars(name),projects(timezone),publish_jobs(status,platform)"
+    )
     .in("status", ["READY_FOR_REVIEW", "DRAFT", "APPROVED", "RENDERED"])
-    .order("created_at", { ascending: false })
+    .order("scheduled_at", { ascending: true, nullsFirst: false })
+    .order("ordering_index", { ascending: true })
+    .order("created_at", { ascending: true })
     .limit(50);
 
   const listError = postsError ? postsError.message : null;
@@ -170,12 +200,16 @@ export default async function QueuePage({
                 <th>Pillar</th>
                 <th>Status</th>
                 <th>Order</th>
+                <th>Scheduled at</th>
                 <th>Preview</th>
                 <th>Action</th>
               </tr>
             </thead>
             <tbody>
               {items.map(post => {
+                const projectTimezone = Array.isArray(post.projects)
+                  ? post.projects[0]?.timezone
+                  : post.projects?.timezone;
                 const publishJobs = Array.isArray(post.publish_jobs) ? post.publish_jobs : [];
                 const publishStatuses = publishJobs.map((job: any) => String(job?.status || ""));
                 const hasFailedPublishJobs = publishJobs.some((job: any) =>
@@ -193,6 +227,7 @@ export default async function QueuePage({
                     </td>
                     <td>{post.status}</td>
                     <td>{post.ordering_index}</td>
+                    <td>{formatScheduledAt(post.scheduled_at, projectTimezone)}</td>
                     <td>
                       <a className="chip" href={`/queue/${post.id}`}>
                         View carousel

@@ -48,7 +48,15 @@ export function buildGoogleSheetCsvUrls(input: string): string[] {
   if (sheetRef.gid) pubHtmlUrl.searchParams.set("gid", sheetRef.gid);
   pubHtmlUrl.searchParams.set("single", "true");
 
-  return [pubUrl.toString(), pubHtmlUrl.toString()];
+  const fallbackPubUrl = new URL(`https://docs.google.com/spreadsheets/d/e/${sheetRef.publishedId}/pub`);
+  fallbackPubUrl.searchParams.set("output", "csv");
+  fallbackPubUrl.searchParams.set("single", "true");
+
+  const fallbackPubHtmlUrl = new URL(`https://docs.google.com/spreadsheets/d/e/${sheetRef.publishedId}/pubhtml`);
+  fallbackPubHtmlUrl.searchParams.set("output", "csv");
+  fallbackPubHtmlUrl.searchParams.set("single", "true");
+
+  return [pubUrl.toString(), pubHtmlUrl.toString(), fallbackPubUrl.toString(), fallbackPubHtmlUrl.toString()];
 }
 
 export function describeGoogleSheetLink(input: string) {

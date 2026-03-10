@@ -7,6 +7,9 @@ type IngestResult = {
   createdPosts: number;
   skippedRows: number;
   createdPillars: number;
+  invalidJsonRows: number;
+  cleanedOrphanPosts: number;
+  replacedExistingPosts: number;
 };
 
 function requireNonEmpty(value: string, errorCode: string) {
@@ -26,14 +29,24 @@ function getRowValue(row: Record<string, string>, key: string) {
 
 function parseSlideJson(raw: string, slideIndex: number) {
   const trimmed = String(raw || "").trim();
-  if (!trimmed) return null;
+  if (!trimmed) return { parsed: null as Record<string, unknown> | null, hadError: false };
   try {
     const parsed = JSON.parse(trimmed);
-    if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>;
+    if (parsed && typeof parsed === "object") {
+      return { parsed: parsed as Record<string, unknown>, hadError: false };
+    }
+    return {
+      parsed: { headline: trimmed },
+      hadError: true,
+      errorCode: `slide_json_invalid:${slideIndex}:not_object`
+    };
   } catch (err: any) {
-    throw new Error(`slide_json_invalid:${slideIndex}:${err?.message || "parse_failed"}`);
+    return {
+      parsed: { headline: trimmed },
+      hadError: true,
+      errorCode: `slide_json_invalid:${slideIndex}:${err?.message || "parse_failed"}`
+    };
   }
-  throw new Error(`slide_json_invalid:${slideIndex}:not_object`);
 }
 
 function normalizeItems(input: unknown) {
@@ -46,6 +59,60 @@ function normalizeItems(input: unknown) {
       .filter(Boolean);
   }
   return undefined;
+}
+
+async function cleanupOrphanPostsForJob(
+  supabase: ReturnType<typeof createSupabaseServerClient>,
+  jobId: string
+) {
+  const { data: posts, error: postsError } = await supabase
+    .from("posts")
+    .select("id")
+    .eq("job_id", jobId);
+  if (postsError) {
+    throw new Error(`db_orphan_posts_lookup_failed:${postsError.message}`);
+  }
+  const postIds = (posts || []).map(post => post.id).filter(Boolean);
+  if (!postIds.length) return 0;
+
+  const { data: slides, error: slidesError } = await supabase
+    .from("slides")
+    .select("post_id")
+    .in("post_id", postIds);
+  if (slidesError) {
+    throw new Error(`db_orphan_slides_lookup_failed:${slidesError.message}`);
+  }
+
+  const slidePostIds = new Set((slides || []).map(slide => slide.post_id).filter(Boolean));
+  const orphanIds = postIds.filter(id => !slidePostIds.has(id));
+  if (!orphanIds.length) return 0;
+
+  const { error: deleteError } = await supabase.from("posts").delete().in("id", orphanIds);
+  if (deleteError) {
+    throw new Error(`db_orphan_posts_delete_failed:${deleteError.message}`);
+  }
+  return orphanIds.length;
+}
+
+async function replaceExistingPostsForJob(
+  supabase: ReturnType<typeof createSupabaseServerClient>,
+  jobId: string
+) {
+  const { data: existing, error: fetchError } = await supabase
+    .from("posts")
+    .select("id")
+    .eq("job_id", jobId);
+  if (fetchError) {
+    throw new Error(`db_existing_posts_lookup_failed:${fetchError.message}`);
+  }
+  const existingCount = (existing || []).length;
+  if (!existingCount) return 0;
+
+  const { error: deleteError } = await supabase.from("posts").delete().eq("job_id", jobId);
+  if (deleteError) {
+    throw new Error(`db_existing_posts_delete_failed:${deleteError.message}`);
+  }
+  return existingCount;
 }
 
 export async function ingestGoogleSheetToJob(params: {
@@ -101,6 +168,9 @@ export async function ingestGoogleSheetToJob(params: {
       ? projectRow.platforms_enabled
       : { instagram: true, tiktok: false };
 
+  const replacedExistingPosts = await replaceExistingPostsForJob(supabase, params.jobId);
+  const cleanedOrphanPosts = await cleanupOrphanPostsForJob(supabase, params.jobId);
+
   let templateId = String(params.templateId || "").trim();
   if (templateId) {
     const { data: template, error: templateError } = await supabase
@@ -142,6 +212,7 @@ export async function ingestGoogleSheetToJob(params: {
   let createdPillars = 0;
   let createdPosts = 0;
   let skippedRows = 0;
+  let invalidJsonRows = 0;
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const row = rows[rowIndex];
@@ -180,10 +251,48 @@ export async function ingestGoogleSheetToJob(params: {
       }
     }
 
+    const slideCount = slideIndexes.length;
+    const preparedSlides = slideIndexes.map(slideIndex => {
+      const jsonRaw = getRowValue(row, `slide_${slideIndex}_json`);
+      const parsedResult = parseSlideJson(jsonRaw, slideIndex);
+      let fields: Record<string, unknown> = {};
+
+      if (parsedResult.parsed) {
+        fields = { ...parsedResult.parsed };
+        const items = normalizeItems((parsedResult.parsed as any).items);
+        if (items) fields.items = items;
+      } else {
+        const text = getRowValue(row, `slide_${slideIndex}`).trim();
+        if (text) {
+          fields.headline = text;
+        }
+      }
+
+      if (slideIndex === slideCount) {
+        fields = {};
+      } else if (!("page_number" in fields)) {
+        fields.page_number = `${slideIndex}/${slideCount}`;
+      }
+
+      return {
+        slide_index: slideIndex,
+        fields,
+        hadJsonError: parsedResult.hadError,
+        jsonErrorCode: parsedResult.errorCode || null
+      };
+    });
+
+    const hadInvalidJson = preparedSlides.some(slide => slide.hadJsonError);
+    if (hadInvalidJson) {
+      invalidJsonRows += 1;
+      const firstError = preparedSlides.find(slide => slide.hadJsonError)?.jsonErrorCode || "slide_json_invalid";
+      console.warn(
+        `[ingest] row ${rowIndex + 1} had invalid slide JSON (${firstError}); falling back to headline text from raw JSON cell`
+      );
+    }
+
     const caption = getRowValue(row, "caption").trim() || null;
     const hashtags = parseHashtags(getRowValue(row, "hashtags"));
-
-    const slideCount = slideIndexes.length;
     const { data: post, error: postError } = await supabase
       .from("posts")
       .insert({
@@ -201,41 +310,18 @@ export async function ingestGoogleSheetToJob(params: {
       .select("id")
       .single();
 
-    if (postError) {
-      throw new Error(`db_create_post_failed:${postError.message}`);
+    if (postError || !post?.id) {
+      throw new Error(`db_create_post_failed:${postError?.message || "post_insert_failed"}`);
     }
 
-    const slidesPayload = slideIndexes.map(slideIndex => {
-      const jsonRaw = getRowValue(row, `slide_${slideIndex}_json`);
-      const parsed = parseSlideJson(jsonRaw, slideIndex);
-      let fields: Record<string, unknown> = {};
-
-      if (parsed) {
-        fields = { ...parsed };
-        const items = normalizeItems((parsed as any).items);
-        if (items) fields.items = items;
-      } else {
-        const text = getRowValue(row, `slide_${slideIndex}`).trim();
-        if (text) {
-          fields.headline = text;
-        }
-      }
-
-      if (slideIndex === slideCount) {
-        fields = {};
-      } else if (!("page_number" in fields)) {
-        fields.page_number = `${slideIndex}/${slideCount}`;
-      }
-
-      return {
-        post_id: post.id,
-        slide_index: slideIndex,
-        fields
-      };
-    });
-
+    const slidesPayload = preparedSlides.map(slide => ({
+      post_id: post.id,
+      slide_index: slide.slide_index,
+      fields: slide.fields
+    }));
     const { error: slidesError } = await supabase.from("slides").insert(slidesPayload);
     if (slidesError) {
+      await supabase.from("posts").delete().eq("id", post.id);
       throw new Error(`db_create_slides_failed:${slidesError.message}`);
     }
 
@@ -246,6 +332,9 @@ export async function ingestGoogleSheetToJob(params: {
     jobId: requireNonEmpty(params.jobId, "job_id_required"),
     createdPosts,
     skippedRows,
-    createdPillars
+    createdPillars,
+    invalidJsonRows,
+    cleanedOrphanPosts,
+    replacedExistingPosts
   };
 }

@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "node ./src/index.js",
     "publisher": "node ./src/publisher.js",
-    "renderer": "node ./src/renderer.js"
+    "publisher:loop": "node ./src/publisher-loop.js",
+    "renderer": "node ./src/renderer.js",
+    "supervisor": "node ./src/control-supervisor.js"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

@@ -1,6 +1,6 @@
 # PRD Task Checklist — Format C + Template Preview
 
-_Last updated: 2026-02-27_
+_Last updated: 2026-03-10_
 
 ## Checklist
 
@@ -23,7 +23,7 @@ _Last updated: 2026-02-27_
 - [x] Store preview URLs in `templates.preview_assets`.
 - [x] Surface preview errors in UI and block assignment.
 - [x] Cache preview by template hash.
-- [ ] Implement preview generation for Format B.
+- [x] Implement preview generation for Format B.
 
 ### Format C Build + Render (Preview)
 - [x] Unzip and build Vite template per `template_hash`.
@@ -55,29 +55,29 @@ _Last updated: 2026-02-27_
 - [ ] Implement publishing step (use rendered assets to post to TikTok or export for manual posting).
 
 ### Deployment Architecture Proposal (Vercel + Fly + Supabase)
-- [ ] Add worker control queue schema (`worker_control_jobs`) for UI-triggered renderer/publisher runs (no direct process spawn from web).
-- [ ] Refactor workers into reusable runners (`runRendererUntilDrained`, `runPublisherOnce`, `runPublisherLoop`) plus thin CLI wrappers.
-- [ ] Add Fly worker supervisor process that:
+- [x] Add worker control queue schema (`worker_control_jobs`) for UI-triggered renderer/publisher runs (no direct process spawn from web).
+- [x] Refactor workers into reusable runners (`runRendererUntilDrained`, `runPublisherOnce`, `runPublisherLoop`) plus thin CLI wrappers.
+- [x] Add worker supervisor process (`services/workers/src/control-supervisor.js`) that:
   - polls control queue,
   - runs requested jobs,
-  - writes structured run results/logs to DB,
+  - writes run results to DB (`worker_control_jobs.result_json` + `events_log`),
   - keeps renderer/publisher schedule loops active.
-- [ ] Add `/operations` UI on web app to:
-  - trigger control jobs (`Run renderer now`, `Run publisher now`),
-  - show worker heartbeat,
-  - show recent run history + error summaries.
-- [ ] Add worker heartbeat + liveness model (`worker_heartbeats` table or equivalent) with stale-worker detection.
+- [x] Add `/operations` UI on web app to:
+  - [x] trigger control jobs (`Run renderer now`, `Run publisher now`),
+  - [x] show worker heartbeat,
+  - [x] show recent run history + error summaries.
+- [x] Add worker heartbeat + liveness model (`worker_heartbeats` table or equivalent) with stale-worker detection.
 - [ ] Add idempotency and concurrency guards:
-  - one active render worker per queue partition,
-  - safe claim/reclaim for stuck jobs,
-  - dedupe on control job idempotency keys.
+  - [ ] one active render worker per queue partition,
+  - [x] safe claim/reclaim for stuck jobs (`claim_worker_control_jobs`, publish stale-claim handling),
+  - [x] dedupe on control job idempotency keys / active scope guard.
 - [ ] Add robust retry/backoff policy config:
-  - renderer retries only on transient failures,
-  - publisher retry windows + max attempts + dead-letter status.
+  - [ ] renderer retries only on transient failures,
+  - [x] publisher retry windows + max attempts + dead-letter status (`FAILED_FINAL`).
 - [ ] Add structured observability:
-  - per-run correlation IDs,
-  - logs persisted to DB and emitted to Fly logs,
-  - alert thresholds for repeated failures.
+  - [ ] per-run correlation IDs,
+  - [x] run status/result persisted to DB (`worker_control_jobs`, `events_log`) and stdout logs available for worker runtime,
+  - [ ] alert thresholds for repeated failures.
 - [ ] Add secrets strategy:
   - keep Supabase + platform secrets in Fly secrets/Vercel env,
   - remove reliance on local `.env` for production execution.
@@ -88,7 +88,7 @@ _Last updated: 2026-02-27_
 
 ### Scheduling + Operations Hardening
 - [ ] Run publisher continuously on Fly (short poll interval) so scheduled posts publish without manual terminal commands.
-- [ ] Keep renderer in drain mode on schedule or control trigger; avoid long idle loops that hide failures.
+- [x] Keep renderer in drain mode on control trigger (no long-running renderer loop).
 - [ ] Add explicit "requeue failed publish jobs" bulk action in UI with audit event.
 - [ ] Add timezone/schedule validation in UI with explicit UTC preview before saving project/job settings.
 
@@ -104,20 +104,30 @@ _Last updated: 2026-02-27_
 
 ---
 
-## Owner / Status / Next Action
+## Sprint-Ready Plan (Owner / Status / ETA)
 
-| Area | Owner | Status | Next action |
+| Sprint | Workstream | Owner | Status | ETA | Next action |
+|---|---|---|---|---|---|
+| Sprint 1 (2026-03-11 → 2026-03-21) | Enforce strict Format C contract (`manifest.json` required; remove fallback default) | Web + Templates | Planned | 2026-03-14 | Update upload validation in `apps/web/lib/templates.ts`, add migration note, and fail fast with clear UI error. |
+| Sprint 1 (2026-03-11 → 2026-03-21) | Queue/publish reliability hardening (UTC schedule preview in UI + bulk requeue failed publish jobs) | Web | Planned | 2026-03-18 | Add UTC preview component in Projects/Jobs forms and add bulk action on `/queue` with audit log event. |
+| Sprint 1 (2026-03-11 → 2026-03-21) | Remove ambiguous local trigger path in production mode | Web + Workers | In progress | 2026-03-18 | Keep control-queue path as default for prod, gate spawn fallback to local/dev only. |
+| Sprint 2 (2026-03-24 → 2026-04-04) | Format A/B production render pipeline | Renderer + Workers | Planned | 2026-04-01 | Implement renderer adapters for A/B and wire through `renderer-runner` with status/error parity to Format C. |
+| Sprint 2 (2026-03-24 → 2026-04-04) | Publishing adapters completion (TikTok + manual export flow) | Workers + Web | Planned | 2026-04-04 | Implement TikTok adapter and expose manual-export output retrieval in UI/storage. |
+| Sprint 2 (2026-03-24 → 2026-04-04) | Retry/backoff parity for renderer jobs | Workers | Planned | 2026-04-04 | Add transient/final render error classification and retry windows like publisher path. |
+| Sprint 3 (2026-04-07 → 2026-04-18) | Fly production rollout (always-on supervisor + publisher loop) | Ops | Planned | 2026-04-11 | Deploy worker service on Fly, set loop poll intervals, and validate scheduled posting with no local terminal dependency. |
+| Sprint 3 (2026-04-07 → 2026-04-18) | Observability + incident readiness | Ops + Workers | Planned | 2026-04-15 | Add correlation IDs, failure threshold alerts, and deployment/rollback runbook. |
+| Sprint 3 (2026-04-07 → 2026-04-18) | Security isolation for build/render | Platform | Planned | 2026-04-18 | Run template build/render in container sandbox, restrict egress, and set CPU/memory/time limits. |
+| Sprint 3 (2026-04-07 → 2026-04-18) | Automated tests baseline | QA + Eng | Planned | 2026-04-18 | Add tests for format detection, preview success/failure, and Format C render smoke path. |
+
+## Current Status Summary
+
+| Area | Owner | Status | ETA |
 |---|---|---|---|
-| Format B preview | TBD | Not started | Implement preview generator for background‑image packs and manifest text boxes. |
-| Format C preview manifest requirement | TBD | Partially done | Enforce `manifest.json` presence for Format C (remove default manifest fallback). |
-| Production renderer (Format C) | TBD | Done | Monitor worker schedule + retries. |
-| Production renderer (Format A/B) | TBD | Not started | Implement HTML/manifest render pipeline. |
-| Publishing queue + status machine | TBD | Done | Implement platform adapters + credentials plumbing. |
-| Instagram publishing adapter | TBD | Done | Configure real IG credentials and run with `PUBLISH_DRY_RUN=false`. |
-| TikTok/manual export publishing | TBD | Not started | Implement adapters and credentials flow. |
-| Security sandboxing | TBD | Not started | Containerize builds and block network egress. |
-| Cache TTL | TBD | Not started | Add TTL/cleanup for `.cache/template-builds`. |
-| Tests | TBD | Not started | Add detection + preview + render tests. |
-| Deployment architecture (Vercel + Fly) | TBD | Proposed | Add worker control queue + Fly supervisor + `/operations` UI control panel. |
-| Worker observability and heartbeat | TBD | Not started | Add heartbeats, run history, and stale-worker alerts. |
-| Scheduling reliability (always-on publisher) | TBD | Not started | Run publisher continuously on Fly with retry/backoff monitoring. |
+| Format B preview | Web + Templates | Done | 2026-03-10 |
+| Worker control queue + supervisor + `/operations` heartbeat/history | Workers + Web | Done (code complete) | 2026-03-10 |
+| Format C production renderer | Renderer + Workers | Done | 2026-03-10 |
+| Format A/B production renderer | Renderer + Workers | Not started | Sprint 2 |
+| TikTok/manual export distribution | Workers + Web | Partial (manual stub, TikTok not implemented) | Sprint 2 |
+| Scheduling reliability on always-on infra | Ops + Workers | In progress | Sprint 3 |
+| Security sandboxing | Platform | Not started | Sprint 3 |
+| Automated tests | QA + Eng | Not started | Sprint 3 |
