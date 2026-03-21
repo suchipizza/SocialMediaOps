@@ -29,6 +29,12 @@ function normalizeErrorMessage(input: unknown) {
   if (raw === "template_in_use_no_replacement") {
     return "Template is still referenced. Upload another template first so we can reassign, then delete again.";
   }
+  if (raw.startsWith("format_c_render_pack_build_failed:")) {
+    return `Format C prebuild failed: ${raw.replace("format_c_render_pack_build_failed:", "")}`;
+  }
+  if (raw === "format_c_render_pack_missing_output") {
+    return "Format C prebuild did not generate dist/build output. Check template build settings.";
+  }
   return raw;
 }
 

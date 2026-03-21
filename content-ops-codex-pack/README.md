@@ -36,3 +36,17 @@ Publishing now uses `publish_jobs` with a status machine (`PENDING`, `SENDING`, 
 - Or per-project `projects.ig_account_config` JSON (stored in `bytea`) with one of:
   - `ig_access_token` + `ig_user_id`
   - `access_token` + `user_id`
+
+## Production Worker Deployment (Fly)
+
+Run supervisor as an always-on worker so renderer/publisher are queue-driven:
+
+- Config: `fly.worker.toml`
+- Image: `content-ops-codex-pack/services/workers/Dockerfile.fly`
+- Runbook: `content-ops-codex-pack/docs/DEPLOY_FLY_WORKER.md`
+
+For production web, use queue-only trigger mode:
+
+- `UI_WORKER_TRIGGER_MODE=queue`
+- `UI_WORKER_TRIGGER_SPAWN_FALLBACK=false`
+- `ENABLE_WORKER_CONTROL_QUEUE=true`

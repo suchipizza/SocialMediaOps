@@ -169,6 +169,15 @@ export async function validateGoogleSheetFormat(sheetUrl: string): Promise<Sheet
       message: "No slide columns found. Expected slide_1_json...slide_n_json (or slide_1...slide_n)."
     });
   }
+  if (!slideIndexes.includes(10)) {
+    issues.push({
+      severity: "warning",
+      code: "missing_slide_10_column",
+      column: "slide_10_json",
+      message:
+        "Slide 10 column is missing. To fix: add slide 10 in source file (create `slide_10_json` or `slide_10`)."
+    });
+  }
 
   const blankHeaderCount = rawHeaders.filter(header => !header).length;
   if (blankHeaderCount > 0) {
@@ -245,6 +254,7 @@ export async function validateGoogleSheetFormat(sheetUrl: string): Promise<Sheet
         });
       }
     }
+
   }
 
   const errorCount = issues.filter(issue => issue.severity === "error").length;
@@ -261,4 +271,3 @@ export async function validateGoogleSheetFormat(sheetUrl: string): Promise<Sheet
     issues
   };
 }
-

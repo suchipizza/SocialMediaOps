@@ -5,8 +5,46 @@ import { ingestGoogleSheetToJob } from "../../lib/ingest";
 import { applyScheduleForJob } from "../../lib/scheduling";
 import { cleanupStalePostArtifacts } from "../../lib/cleanup";
 import { SheetValidator } from "./sheet-validator";
+import { ScheduleUtcPreview } from "../components/schedule-utc-preview";
+import {
+  buildUtcSchedulePreview,
+  isValidDateInput,
+  isValidTimezone,
+  parseSlotTimesWithValidation
+} from "../../lib/schedule-validation";
 
 export const dynamic = "force-dynamic";
+
+async function validateProjectScheduleForStartDate(
+  supabase: ReturnType<typeof createSupabaseServerClient>,
+  projectId: string,
+  startDate: string
+) {
+  const { data: project, error: projectError } = await supabase
+    .from("projects")
+    .select("id,timezone,slot_times")
+    .eq("id", projectId)
+    .single();
+  if (projectError || !project?.id) {
+    throw new Error(projectError?.message || "project_not_found");
+  }
+
+  const timezone = String(project.timezone || "Europe/Zurich").trim() || "Europe/Zurich";
+  if (!isValidTimezone(timezone)) {
+    throw new Error(`invalid_project_timezone:${timezone}`);
+  }
+  const { slotTimes, invalid } = parseSlotTimesWithValidation(project.slot_times);
+  if (invalid.length) {
+    throw new Error(`invalid_project_slot_times:${invalid.join(",")}`);
+  }
+
+  buildUtcSchedulePreview({
+    startDate,
+    timezone,
+    slotTimes,
+    previewCount: 3
+  });
+}
 
 async function createJob(formData: FormData) {
   "use server";
@@ -20,10 +58,18 @@ async function createJob(formData: FormData) {
   if (!projectId || !startDate || !templateId) {
     redirect(`/jobs?error=${encodeURIComponent("Template, project, and start date are required.")}`);
   }
+  if (!isValidDateInput(startDate)) {
+    redirect(`/jobs?error=${encodeURIComponent(`invalid_start_date:${startDate}`)}`);
+  }
 
   const resolvedIngestSource = sheetUrl ? "sheets" : ingestSource;
 
   const supabase = createSupabaseServerClient();
+  try {
+    await validateProjectScheduleForStartDate(supabase, projectId, startDate);
+  } catch (error: any) {
+    redirect(`/jobs?error=${encodeURIComponent(error?.message || "job_schedule_preview_invalid")}`);
+  }
   const { data: job, error: jobError } = await supabase
     .from("jobs")
     .insert({
@@ -249,8 +295,25 @@ async function updateJobSettings(formData: FormData) {
   if (!jobId || !startDate) {
     redirect(`/jobs?error=${encodeURIComponent("Job and start date are required.")}`);
   }
+  if (!isValidDateInput(startDate)) {
+    redirect(`/jobs?error=${encodeURIComponent(`invalid_start_date:${startDate}`)}`);
+  }
 
   const supabase = createSupabaseServerClient();
+  const { data: job, error: jobError } = await supabase
+    .from("jobs")
+    .select("id,project_id")
+    .eq("id", jobId)
+    .single();
+  if (jobError || !job?.id || !job?.project_id) {
+    redirect(`/jobs?error=${encodeURIComponent(jobError?.message || "job_not_found")}`);
+  }
+  try {
+    await validateProjectScheduleForStartDate(supabase, String(job.project_id), startDate);
+  } catch (schedulePreviewError: any) {
+    redirect(`/jobs?error=${encodeURIComponent(schedulePreviewError?.message || "job_schedule_preview_invalid")}`);
+  }
+
   const { error } = await supabase
     .from("jobs")
     .update({
@@ -305,15 +368,24 @@ export default async function JobsPage({
   const supabase = createSupabaseServerClient();
   const { data: projectsData } = await supabase
     .from("projects")
-    .select("id,name")
+    .select("id,name,timezone,slot_times")
     .order("created_at", { ascending: false });
   const { data: jobsData } = await supabase
     .from("jobs")
-    .select("id,status,start_date,target_post_count,ingest_source,template_id,projects(name),templates(name)")
+    .select(
+      "id,status,start_date,target_post_count,ingest_source,template_id,projects(name,timezone,slot_times),templates(name)"
+    )
     .order("created_at", { ascending: false });
 
   const projects = (projectsData || []) as any[];
   const jobs = (jobsData || []) as any[];
+  const projectSchedules = projects.reduce<Record<string, { timezone: string; slotTimes: string[] }>>((acc, project) => {
+    acc[project.id] = {
+      timezone: String(project.timezone || "Europe/Zurich"),
+      slotTimes: Array.isArray(project.slot_times) ? project.slot_times.map((value: any) => String(value)) : []
+    };
+    return acc;
+  }, {});
   const { data: templatesData } = await supabase
     .from("templates")
     .select("id,name,format,status,created_at")
@@ -419,6 +491,12 @@ export default async function JobsPage({
               <label htmlFor="start_date">Start date</label>
               <input id="start_date" name="start_date" type="date" required />
             </div>
+            <ScheduleUtcPreview
+              title="Schedule UTC preview"
+              projectSelectId="project_id"
+              startDateInputId="start_date"
+              projectSchedules={projectSchedules}
+            />
             <div className="field">
               <label htmlFor="target_post_count">Target posts</label>
               <input id="target_post_count" name="target_post_count" type="number" defaultValue={21} />
@@ -464,7 +542,13 @@ export default async function JobsPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {jobs.map((job: any) => (
+                  {jobs.map((job: any) => {
+                    const project = Array.isArray(job.projects) ? job.projects[0] : job.projects;
+                    const jobTimezone = String(project?.timezone || "Europe/Zurich");
+                    const jobSlotTimes = Array.isArray(project?.slot_times)
+                      ? project.slot_times.map((value: any) => String(value))
+                      : [];
+                    return (
                     <tr key={job.id}>
                       <td>
                         {(Array.isArray(job.projects) ? job.projects[0]?.name : job.projects?.name) || job.id}
@@ -532,6 +616,12 @@ export default async function JobsPage({
                               <label htmlFor={`job_start_${job.id}`}>Start date</label>
                               <input id={`job_start_${job.id}`} name="start_date" type="date" defaultValue={job.start_date} required />
                             </div>
+                            <ScheduleUtcPreview
+                              title="Schedule UTC preview"
+                              startDateInputId={`job_start_${job.id}`}
+                              fixedTimezone={jobTimezone}
+                              fixedSlotTimes={jobSlotTimes}
+                            />
                             <div className="field">
                               <label htmlFor={`job_target_${job.id}`}>Target posts</label>
                               <input
@@ -564,7 +654,8 @@ export default async function JobsPage({
                         )}
                       </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

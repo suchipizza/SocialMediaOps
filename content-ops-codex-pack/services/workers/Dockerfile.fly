@@ -1,0 +1,19 @@
+FROM mcr.microsoft.com/playwright:v1.47.0-jammy
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Install worker and renderer runtime dependencies separately.
+# Renderer deps are required because worker imports services/renderer/src/format-c.js.
+COPY content-ops-codex-pack/services/workers/package.json content-ops-codex-pack/services/workers/package-lock.json /app/content-ops-codex-pack/services/workers/
+COPY content-ops-codex-pack/services/renderer/package.json content-ops-codex-pack/services/renderer/package-lock.json /app/content-ops-codex-pack/services/renderer/
+
+RUN npm ci --omit=dev --prefix /app/content-ops-codex-pack/services/workers \
+  && npm ci --omit=dev --prefix /app/content-ops-codex-pack/services/renderer \
+  && npx --prefix /app/content-ops-codex-pack/services/renderer playwright install chromium
+
+COPY content-ops-codex-pack/services/workers/src /app/content-ops-codex-pack/services/workers/src
+COPY content-ops-codex-pack/services/renderer/src /app/content-ops-codex-pack/services/renderer/src
+
+WORKDIR /app/content-ops-codex-pack/services/workers
+CMD ["node", "./src/control-supervisor.js"]

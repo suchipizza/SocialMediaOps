@@ -234,8 +234,22 @@ async function ensureFormatCBuild(params: { templateHash: string; zip: JSZip }) 
   const repoRoot = getRepoRoot();
   const cacheRoot = path.join(repoRoot, ".cache", "template-builds");
   const templateDir = path.join(cacheRoot, params.templateHash);
-  const distIndex = path.join(templateDir, "dist", "index.html");
-  const buildIndex = path.join(templateDir, "build", "index.html");
+  const findBuiltEntry = async () => {
+    const distIndex = path.join(templateDir, "dist", "index.html");
+    const buildIndex = path.join(templateDir, "build", "index.html");
+    try {
+      await fs.access(distIndex);
+      return distIndex;
+    } catch {
+      // continue
+    }
+    try {
+      await fs.access(buildIndex);
+      return buildIndex;
+    } catch {
+      return null;
+    }
+  };
 
   async function removeWithRetries(target: string) {
     const maxAttempts = 4;
@@ -269,12 +283,8 @@ async function ensureFormatCBuild(params: { templateHash: string; zip: JSZip }) 
     }
   }
 
-  try {
-    await fs.access(distIndex);
-    return { templateDir, distIndex };
-  } catch {
-    // continue build
-  }
+  const cachedBuilt = await findBuiltEntry();
+  if (cachedBuilt) return { templateDir, distIndex: cachedBuilt };
 
   await safeResetDirectory(templateDir);
   await fs.mkdir(templateDir, { recursive: true });
@@ -298,6 +308,18 @@ async function ensureFormatCBuild(params: { templateHash: string; zip: JSZip }) 
     })
   );
 
+  const extractedBuilt = await findBuiltEntry();
+  if (extractedBuilt) {
+    return { templateDir, distIndex: extractedBuilt };
+  }
+
+  const packageJson = path.join(templateDir, "package.json");
+  try {
+    await fs.access(packageJson);
+  } catch {
+    throw new Error("format_c_build_missing_output (expected dist/index.html or build/index.html)");
+  }
+
   const pkgLock = path.join(templateDir, "package-lock.json");
   let hasLock = false;
   try {
@@ -307,28 +329,28 @@ async function ensureFormatCBuild(params: { templateHash: string; zip: JSZip }) 
     hasLock = false;
   }
 
-  const installArgs = hasLock ? ["ci", "--no-fund", "--no-audit"] : ["install", "--no-fund", "--no-audit"];
-  await execFileAsync("npm", installArgs, { cwd: templateDir, env: process.env });
+  const installArgs = hasLock
+    ? ["ci", "--include=dev", "--no-fund", "--no-audit"]
+    : ["install", "--include=dev", "--no-fund", "--no-audit"];
+  const buildEnv = {
+    ...process.env,
+    NODE_ENV: "development",
+    npm_config_production: "false",
+    NPM_CONFIG_PRODUCTION: "false"
+  } as NodeJS.ProcessEnv;
+  await execFileAsync("npm", installArgs, { cwd: templateDir, env: buildEnv });
 
   try {
-    await execFileAsync("npm", ["run", "build", "--", "--base=./"], { cwd: templateDir, env: process.env });
+    await execFileAsync("npm", ["run", "build", "--", "--base=./"], { cwd: templateDir, env: buildEnv });
   } catch {
-    await execFileAsync("npm", ["run", "build"], { cwd: templateDir, env: process.env });
+    await execFileAsync("npm", ["run", "build"], { cwd: templateDir, env: buildEnv });
   }
 
-  try {
-    await fs.access(distIndex);
-    return { templateDir, distIndex };
-  } catch {
-    // fall through
-  }
-
-  try {
-    await fs.access(buildIndex);
-    return { templateDir, distIndex: buildIndex };
-  } catch {
+  const builtAfterCompile = await findBuiltEntry();
+  if (!builtAfterCompile) {
     throw new Error("format_c_build_missing_output (expected dist/index.html or build/index.html)");
   }
+  return { templateDir, distIndex: builtAfterCompile };
 }
 
 async function renderFormatCSlides(params: {
@@ -653,13 +675,18 @@ async function renderFormatCSlides(params: {
 
         const sortedBySize = [...textNodes].sort((a, b) => getFontSize(b) - getFontSize(a));
 
-        const setText = (node: HTMLElement | null | undefined, value: string, clearIfEmpty = false) => {
+        const setText = (
+          node: HTMLElement | null | undefined,
+          value: string,
+          clearIfEmpty = false,
+          preserveIfEmpty = false
+        ) => {
           if (!node) return;
           if (value) {
             node.textContent = value;
             return;
           }
-          if (clearIfEmpty) {
+          if (clearIfEmpty && !preserveIfEmpty) {
             node.textContent = "";
           }
         };
@@ -675,12 +702,14 @@ async function renderFormatCSlides(params: {
           return null;
         };
 
+        const preserveCtaDefaults = slideIndex === slideCount;
+
         const headlineNode = pickNode([
           slideRoot.querySelector("[data-field='headline']") as HTMLElement | null,
           textNodes.find(node => ["H1", "H2", "H3"].includes(node.tagName)),
           sortedBySize[0]
         ]);
-        setText(headlineNode, headline, true);
+        setText(headlineNode, headline, true, preserveCtaDefaults);
 
         const subheadNode = pickNode([
           slideRoot.querySelector("[data-field='subhead']") as HTMLElement | null,
@@ -689,14 +718,14 @@ async function renderFormatCSlides(params: {
           sortedBySize.find(node => !used.has(node))
         ]);
         const secondary = subhead || body;
-        setText(subheadNode, secondary, true);
+        setText(subheadNode, secondary, true, preserveCtaDefaults);
 
         if (body && subhead) {
           const bodyNode = pickNode([
             slideRoot.querySelector("[data-field='body']") as HTMLElement | null,
             sortedBySize.find(node => !used.has(node))
           ]);
-          setText(bodyNode, body, true);
+          setText(bodyNode, body, true, preserveCtaDefaults);
         }
 
         const quoteNode =

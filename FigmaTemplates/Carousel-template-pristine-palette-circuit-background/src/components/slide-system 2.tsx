@@ -283,7 +283,8 @@ export const CTALayout: React.FC<{ text: string }> = ({ text }) => {
         </div>
       </div>
       <div className="flex flex-col gap-8">
-        <p 
+        <p
+          data-field="headline"
           style={{
             fontSize: '72px',
             fontWeight: 700,
@@ -296,7 +297,8 @@ export const CTALayout: React.FC<{ text: string }> = ({ text }) => {
           Build the relationship you want.
         </p>
         <div className="flex flex-col gap-4 items-center">
-          <p 
+          <p
+            data-field="subhead"
             style={{
               fontSize: '40px',
               fontWeight: 400,

@@ -1,0 +1,31 @@
+app = "content-ops-worker"
+primary_region = "iad"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "content-ops-codex-pack/services/workers/Dockerfile.fly"
+
+[env]
+  NODE_ENV = "production"
+  APP_ENV = "production"
+  WORKER_PUBLISHER_LOOP_ENABLED = "true"
+  WORKER_CONTROL_POLL_MS = "5000"
+  WORKER_CONTROL_JOB_KEEPALIVE_MS = "30000"
+  WORKER_CONTROL_JOB_KEEPALIVE_FAILURE_THRESHOLD = "3"
+  PUBLISH_LOOP_POLL_MS = "15000"
+  WORKER_SUPERVISOR_LOCK_KEY = "control:supervisor:singleton"
+  WORKER_SUPERVISOR_LEASE_SECONDS = "600"
+  WORKER_HEARTBEAT_RETENTION_DAYS = "7"
+  RENDER_POST_TIMEOUT_MS = "180000"
+  RENDER_SLIDE_READY_TIMEOUT_MS = "20000"
+  RENDER_NETWORK_IDLE_TIMEOUT_MS = "3000"
+  RENDER_SLIDE_SETTLE_DELAY_MS = "80"
+  RENDER_BATCH_SIZE = "1"
+[processes]
+  app = "node ./src/control-supervisor.js"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "2048mb"

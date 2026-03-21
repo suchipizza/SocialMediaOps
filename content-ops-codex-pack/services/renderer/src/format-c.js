@@ -2,12 +2,12 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import JSZip from "jszip";
 import { chromium } from "playwright";
 
-const execFileAsync = promisify(execFile);
+const DEFAULT_SLIDE_READY_TIMEOUT_MS = 20_000;
+const DEFAULT_NETWORK_IDLE_TIMEOUT_MS = 3_000;
+const DEFAULT_SLIDE_SETTLE_DELAY_MS = 80;
 
 function getRepoRoot() {
   const cwd = process.cwd();
@@ -49,6 +49,65 @@ function normalizeFields(raw) {
     return fields;
   }
   return {};
+}
+
+function parseBoundedInt(value, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(Math.max(parsed, min), max);
+}
+
+function resolveRenderTimings(manifest) {
+  const renderConfig = manifest?.render && typeof manifest.render === "object" ? manifest.render : {};
+  return {
+    slideReadyTimeoutMs: parseBoundedInt(
+      renderConfig.slide_ready_timeout_ms ?? process.env.RENDER_SLIDE_READY_TIMEOUT_MS,
+      DEFAULT_SLIDE_READY_TIMEOUT_MS,
+      { min: 2_000, max: 180_000 }
+    ),
+    networkIdleTimeoutMs: parseBoundedInt(
+      renderConfig.network_idle_timeout_ms ?? process.env.RENDER_NETWORK_IDLE_TIMEOUT_MS,
+      DEFAULT_NETWORK_IDLE_TIMEOUT_MS,
+      { min: 0, max: 30_000 }
+    ),
+    settleDelayMs: parseBoundedInt(
+      renderConfig.settle_delay_ms ?? process.env.RENDER_SLIDE_SETTLE_DELAY_MS,
+      DEFAULT_SLIDE_SETTLE_DELAY_MS,
+      { min: 0, max: 5_000 }
+    )
+  };
+}
+
+async function waitForSlideRootReady({ page, slideIndex, timeoutMs }) {
+  const selector = `#slide-${slideIndex}`;
+  try {
+    await page.waitForFunction(
+      sel => {
+        const node = document.querySelector(sel);
+        if (!(node instanceof HTMLElement)) return false;
+        const rect = node.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        const style = getComputedStyle(node);
+        if (style.display === "none" || style.visibility === "hidden") return false;
+        return true;
+      },
+      selector,
+      { timeout: timeoutMs }
+    );
+  } catch {
+    const detail = await page
+      .evaluate(sel => {
+        const node = document.querySelector(sel);
+        if (!(node instanceof HTMLElement)) {
+          return "missing";
+        }
+        const rect = node.getBoundingClientRect();
+        const style = getComputedStyle(node);
+        return `present:${Math.round(rect.width)}x${Math.round(rect.height)}:${style.display}:${style.visibility}`;
+      }, selector)
+      .catch(() => "unknown");
+    throw new Error(`slide_root_not_ready:${slideIndex}:${detail}`);
+  }
 }
 
 async function startStaticServer(rootDir) {
@@ -102,38 +161,41 @@ async function removeWithRetries(target) {
   }
 }
 
-async function safeResetDirectory(target) {
-  try {
-    await fs.access(target);
-  } catch {
-    return;
+async function resolvePrebuiltEntry(templateDir) {
+  const candidates = [
+    path.join(templateDir, "dist", "index.html"),
+    path.join(templateDir, "build", "index.html")
+  ];
+  for (const candidate of candidates) {
+    try {
+      await fs.access(candidate);
+      return { templateDir, distIndex: candidate };
+    } catch {
+      // continue
+    }
   }
-  const stalePath = `${target}-stale-${Date.now()}`;
-  try {
-    await fs.rename(target, stalePath);
-    await removeWithRetries(stalePath);
-  } catch {
-    await removeWithRetries(target);
+
+  const firstLevel = await fs.readdir(templateDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of firstLevel) {
+    if (!entry.isDirectory()) continue;
+    const nestedCandidates = [
+      path.join(templateDir, entry.name, "dist", "index.html"),
+      path.join(templateDir, entry.name, "build", "index.html")
+    ];
+    for (const candidate of nestedCandidates) {
+      try {
+        await fs.access(candidate);
+        return { templateDir, distIndex: candidate };
+      } catch {
+        // continue
+      }
+    }
   }
+
+  return null;
 }
 
-async function ensureFormatCBuild({ templateHash, zipBuffer }) {
-  const repoRoot = getRepoRoot();
-  const cacheRoot = process.env.RENDERER_CACHE_DIR || path.join(repoRoot, ".cache", "renderer-builds");
-  const templateDir = path.join(cacheRoot, templateHash);
-  const distIndex = path.join(templateDir, "dist", "index.html");
-  const buildIndex = path.join(templateDir, "build", "index.html");
-
-  try {
-    await fs.access(distIndex);
-    return { templateDir, distIndex };
-  } catch {
-    // continue build
-  }
-
-  await safeResetDirectory(templateDir);
-  await fs.mkdir(templateDir, { recursive: true });
-
+async function extractZipIntoDir({ zipBuffer, targetDir }) {
   const zip = await JSZip.loadAsync(zipBuffer);
   const fileEntries = Object.values(zip.files).filter(entry => !entry.dir);
   const filtered = fileEntries.filter(
@@ -147,42 +209,50 @@ async function ensureFormatCBuild({ templateHash, zipBuffer }) {
     filtered.map(async entry => {
       const normalized = allSameRoot ? entry.name.split("/").slice(1).join("/") : entry.name;
       if (!normalized) return;
-      const targetPath = path.join(templateDir, normalized);
+      const targetPath = path.join(targetDir, normalized);
       await fs.mkdir(path.dirname(targetPath), { recursive: true });
       const buf = await entry.async("nodebuffer");
       await fs.writeFile(targetPath, buf);
     })
   );
+}
 
-  const pkgLock = path.join(templateDir, "package-lock.json");
-  let hasLock = false;
-  try {
-    await fs.access(pkgLock);
-    hasLock = true;
-  } catch {
-    hasLock = false;
-  }
+async function ensureFormatCBuild({ templateHash, zipBuffer }) {
+  const repoRoot = getRepoRoot();
+  const cacheRoot = process.env.RENDERER_CACHE_DIR || path.join(repoRoot, ".cache", "renderer-builds");
+  const templateDir = path.join(cacheRoot, templateHash);
 
-  const installArgs = hasLock ? ["ci", "--no-fund", "--no-audit"] : ["install", "--no-fund", "--no-audit"];
-  await execFileAsync("npm", installArgs, { cwd: templateDir, env: process.env });
+  const cached = await resolvePrebuiltEntry(templateDir);
+  if (cached) return cached;
 
-  try {
-    await execFileAsync("npm", ["run", "build", "--", "--base=./"], { cwd: templateDir, env: process.env });
-  } catch {
-    await execFileAsync("npm", ["run", "build"], { cwd: templateDir, env: process.env });
-  }
+  await fs.mkdir(cacheRoot, { recursive: true });
+  const stagingDir = `${templateDir}.tmp-${process.pid}-${Date.now()}`;
+  await fs.mkdir(stagingDir, { recursive: true });
 
   try {
-    await fs.access(distIndex);
-    return { templateDir, distIndex };
-  } catch {
-    // continue
-  }
-  try {
-    await fs.access(buildIndex);
-    return { templateDir, distIndex: buildIndex };
-  } catch {
-    throw new Error("format_c_build_missing_output");
+    await extractZipIntoDir({ zipBuffer, targetDir: stagingDir });
+    const stagedBundle = await resolvePrebuiltEntry(stagingDir);
+    if (!stagedBundle) {
+      throw new Error("format_c_prebuilt_bundle_missing_output");
+    }
+
+    try {
+      await fs.rename(stagingDir, templateDir);
+    } catch (err) {
+      if (!["EEXIST", "ENOTEMPTY"].includes(err?.code || "")) {
+        throw err;
+      }
+      await removeWithRetries(stagingDir);
+    }
+
+    const finalBundle = await resolvePrebuiltEntry(templateDir);
+    if (!finalBundle) {
+      throw new Error("format_c_prebuilt_bundle_cache_invalid");
+    }
+    return finalBundle;
+  } catch (err) {
+    await removeWithRetries(stagingDir).catch(() => {});
+    throw err;
   }
 }
 
@@ -199,6 +269,7 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
 
   const slideCount = manifest.slide_count || payloads.length;
   const { width, height, format, quality } = output;
+  const { slideReadyTimeoutMs, networkIdleTimeoutMs, settleDelayMs } = resolveRenderTimings(manifest);
 
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width, height } });
@@ -209,29 +280,35 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
   }
 
   const buffers = [];
-  for (let i = 1; i <= slideCount; i += 1) {
-    const payload = payloadMap.get(i);
-    if (!payload) {
-      throw new Error(`slide_payload_missing:${i}`);
-    }
-    const fields = normalizeFields(payload.fields);
-    const data = {
-      output,
-      post: {
-        slide_index: payload.slide_index,
-        slide_count: payload.slide_count,
-        fields
+  try {
+    for (let i = 1; i <= slideCount; i += 1) {
+      const payload = payloadMap.get(i);
+      if (!payload) {
+        throw new Error(`slide_payload_missing:${i}`);
       }
-    };
-    const encoded = base64UrlEncode(JSON.stringify(data));
-    const slideParam = manifest.render?.query?.slide || "slide";
-    const dataParam = manifest.render?.query?.data || "data";
-    const url = `${server.baseUrl}/index.html?${encodeURIComponent(slideParam)}=${i}&${encodeURIComponent(dataParam)}=${encoded}`;
-    await page.goto(url, { waitUntil: "load" });
-    await page.waitForSelector(`#slide-${i}`, { timeout: 8000 });
-    await page.waitForLoadState("networkidle").catch(() => {});
+      const fields = normalizeFields(payload.fields);
+      const data = {
+        output,
+        post: {
+          slide_index: payload.slide_index,
+          slide_count: payload.slide_count,
+          fields
+        }
+      };
+      const encoded = base64UrlEncode(JSON.stringify(data));
+      const slideParam = manifest.render?.query?.slide || "slide";
+      const dataParam = manifest.render?.query?.data || "data";
+      const url = `${server.baseUrl}/index.html?${encodeURIComponent(slideParam)}=${i}&${encodeURIComponent(dataParam)}=${encoded}`;
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: slideReadyTimeoutMs });
+      await waitForSlideRootReady({ page, slideIndex: i, timeoutMs: slideReadyTimeoutMs });
+      if (networkIdleTimeoutMs > 0) {
+        await page.waitForLoadState("networkidle", { timeout: networkIdleTimeoutMs }).catch(() => {});
+      }
+      if (settleDelayMs > 0) {
+        await page.waitForTimeout(settleDelayMs);
+      }
 
-    await page.evaluate(({ slideIndex, slideCount, width, height, fields, capture }) => {
+      await page.evaluate(({ slideIndex, slideCount, width, height, fields, capture }) => {
       const allSlides = Array.from(document.querySelectorAll("[id^='slide-']"))
         .filter(node => node instanceof HTMLElement);
       const parsedSlides = allSlides.map(node => {
@@ -500,13 +577,13 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
 
         const sortedBySize = [...textNodes].sort((a, b) => getFontSize(b) - getFontSize(a));
 
-        const setText = (node, value, clearIfEmpty = false) => {
+        const setText = (node, value, clearIfEmpty = false, preserveIfEmpty = false) => {
           if (!node) return;
           if (value) {
             node.textContent = value;
             return;
           }
-          if (clearIfEmpty) {
+          if (clearIfEmpty && !preserveIfEmpty) {
             node.textContent = "";
           }
         };
@@ -522,12 +599,14 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
           return null;
         };
 
+        const preserveCtaDefaults = slideIndex === slideCount;
+
         const headlineNode = pickNode([
           slideRoot.querySelector("[data-field='headline']"),
           textNodes.find(node => ["H1", "H2", "H3"].includes(node.tagName)),
           sortedBySize[0]
         ]);
-        setText(headlineNode, headline, true);
+        setText(headlineNode, headline, true, preserveCtaDefaults);
 
         const subheadNode = pickNode([
           slideRoot.querySelector("[data-field='subhead']"),
@@ -536,14 +615,14 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
           sortedBySize.find(node => !used.has(node))
         ]);
         const secondary = subhead || body;
-        setText(subheadNode, secondary, true);
+        setText(subheadNode, secondary, true, preserveCtaDefaults);
 
         if (body && subhead) {
           const bodyNode = pickNode([
             slideRoot.querySelector("[data-field='body']"),
             sortedBySize.find(node => !used.has(node))
           ]);
-          setText(bodyNode, body, true);
+          setText(bodyNode, body, true, preserveCtaDefaults);
         }
 
         const quoteNode =
@@ -692,24 +771,26 @@ export async function renderFormatCSlides({ manifest, zipBuffer, payloads }) {
           setText(pageNode, pageNumber, true);
         }
       }
-    }, { slideIndex: i, slideCount, width, height, fields: payload.fields || {}, capture: captureMode });
+      }, { slideIndex: i, slideCount, width, height, fields: payload.fields || {}, capture: captureMode });
 
-    const handle = await page.$("[data-render-root='true']");
-    const buf = handle
-      ? await handle.screenshot({
-          type: format === "png" ? "png" : "jpeg",
-          quality: format === "jpeg" ? quality : undefined
-        })
-      : await page.screenshot({
-          type: format === "png" ? "png" : "jpeg",
-          quality: format === "jpeg" ? quality : undefined,
-          fullPage: false
-        });
-    buffers.push(buf);
+      const handle = await page.$("[data-render-root='true']");
+      const buf = handle
+        ? await handle.screenshot({
+            type: format === "png" ? "png" : "jpeg",
+            quality: format === "jpeg" ? quality : undefined
+          })
+        : await page.screenshot({
+            type: format === "png" ? "png" : "jpeg",
+            quality: format === "jpeg" ? quality : undefined,
+            fullPage: false
+          });
+      buffers.push(buf);
+    }
+
+    return { buffers, output, templateHash };
+  } finally {
+    await page.close().catch(() => {});
+    await browser.close().catch(() => {});
+    await server.close().catch(() => {});
   }
-
-  await browser.close();
-  await server.close();
-
-  return { buffers, output, templateHash };
 }

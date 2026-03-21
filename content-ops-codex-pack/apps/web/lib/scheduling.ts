@@ -1,4 +1,11 @@
-const DEFAULT_SLOTS = ["09:00", "13:00", "18:00"];
+import {
+  addDays,
+  isValidDateInput,
+  isValidTimezone,
+  parseSlotTimesWithValidation,
+  zonedDateTimeToUtcIso
+} from "./schedule-validation";
+
 const ACTIVE_PUBLISH_STATUSES = ["PENDING", "FAILED_RETRYABLE", "SENDING"];
 
 type SupabaseLike = {
@@ -12,65 +19,8 @@ type JobScheduleContext = {
   projects?: { timezone?: string | null; slot_times?: unknown } | Array<{ timezone?: string | null; slot_times?: unknown }> | null;
 };
 
-function parseOffsetMs(offsetLabel: string) {
-  const match = offsetLabel.match(/GMT([+-])(\d{1,2})(?::?(\d{2}))?/i);
-  if (!match) return 0;
-  const sign = match[1] === "-" ? -1 : 1;
-  const hours = Number.parseInt(match[2], 10) || 0;
-  const minutes = Number.parseInt(match[3] || "0", 10) || 0;
-  return sign * (hours * 60 + minutes) * 60 * 1000;
-}
-
-function getOffsetMsAt(utcDate: Date, timezone: string) {
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    timeZoneName: "longOffset",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23"
-  });
-  const parts = formatter.formatToParts(utcDate);
-  const zone = parts.find(part => part.type === "timeZoneName")?.value || "GMT+00:00";
-  return parseOffsetMs(zone);
-}
-
-function zonedDateTimeToUtcIso(dateStr: string, timeStr: string, timezone: string) {
-  const [year, month, day] = dateStr.split("-").map(value => Number.parseInt(value, 10));
-  const [hour, minute] = timeStr.split(":").map(value => Number.parseInt(value, 10));
-  const baseUtc = Date.UTC(year, (month || 1) - 1, day || 1, hour || 0, minute || 0, 0, 0);
-
-  let utcMs = baseUtc;
-  for (let i = 0; i < 2; i += 1) {
-    const offsetMs = getOffsetMsAt(new Date(utcMs), timezone);
-    utcMs = baseUtc - offsetMs;
-  }
-
-  return new Date(utcMs).toISOString();
-}
-
-function addDays(dateStr: string, days: number) {
-  const [year, month, day] = dateStr.split("-").map(value => Number.parseInt(value, 10));
-  const date = new Date(Date.UTC(year, (month || 1) - 1, day || 1));
-  date.setUTCDate(date.getUTCDate() + days);
-  return [
-    String(date.getUTCFullYear()).padStart(4, "0"),
-    String(date.getUTCMonth() + 1).padStart(2, "0"),
-    String(date.getUTCDate()).padStart(2, "0")
-  ].join("-");
-}
-
 export function parseSlotTimes(input: unknown) {
-  const raw = Array.isArray(input)
-    ? input.map(value => String(value || "").trim())
-    : String(input || "")
-        .split(",")
-        .map(value => value.trim());
-  const valid = raw.filter(value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value));
-  return valid.length ? valid : [...DEFAULT_SLOTS];
+  return parseSlotTimesWithValidation(input).slotTimes;
 }
 
 function pickProjectConfig(projects: JobScheduleContext["projects"]) {
@@ -88,11 +38,19 @@ export async function applyScheduleForJob(supabase: SupabaseLike, jobId: string)
     .eq("id", normalizedJobId)
     .single();
   if (jobError || !job?.id) throw new Error(`job_not_found:${jobError?.message || normalizedJobId}`);
-  if (!job.start_date) throw new Error("job_start_date_required");
+  if (!job.start_date || !isValidDateInput(String(job.start_date))) {
+    throw new Error(`job_start_date_required:${job.start_date || "missing"}`);
+  }
 
   const project = pickProjectConfig((job as JobScheduleContext).projects);
   const timezone = String(project.timezone || "Europe/Zurich");
-  const slotTimes = parseSlotTimes(project.slot_times);
+  if (!isValidTimezone(timezone)) {
+    throw new Error(`invalid_project_timezone:${timezone}`);
+  }
+  const { slotTimes, invalid } = parseSlotTimesWithValidation(project.slot_times);
+  if (invalid.length) {
+    throw new Error(`invalid_project_slot_times:${invalid.join(",")}`);
+  }
 
   const { data: posts, error: postsError } = await supabase
     .from("posts")

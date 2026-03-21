@@ -40,10 +40,12 @@ function extractStoragePath(url: string | null | undefined, bucket: string) {
     const publicMarker = `/storage/v1/object/public/${bucket}/`;
     const signedMarker = `/storage/v1/object/sign/${bucket}/`;
     if (pathName.includes(publicMarker)) {
-      return pathName.split(publicMarker)[1]?.replace(/^\/+/, "") || null;
+      const rawPath = pathName.split(publicMarker)[1]?.replace(/^\/+/, "") || "";
+      return decodeURIComponent(rawPath);
     }
     if (pathName.includes(signedMarker)) {
-      return pathName.split(signedMarker)[1]?.replace(/^\/+/, "") || null;
+      const rawPath = pathName.split(signedMarker)[1]?.replace(/^\/+/, "") || "";
+      return decodeURIComponent(rawPath);
     }
   } catch {
     return null;
@@ -97,124 +99,128 @@ async function fetchTemplateZip(params: {
 }
 
 export async function GET(request: Request) {
-  const url = new URL(request.url);
-  const postIdRaw = url.searchParams.get("post_id");
-  const slideParam = url.searchParams.get("slide");
-  const hashParam = url.searchParams.get("hash") || "";
+  try {
+    const url = new URL(request.url);
+    const postIdRaw = url.searchParams.get("post_id");
+    const slideParam = url.searchParams.get("slide");
+    if (!postIdRaw) return toErrorImage("post_id_required");
 
-  if (!postIdRaw) return toErrorImage("post_id_required");
+    const slideIndex = Number(slideParam || "0");
+    if (!Number.isFinite(slideIndex) || slideIndex < 1) return toErrorImage("slide_required");
 
-  const slideIndex = Number(slideParam || "0");
-  if (!Number.isFinite(slideIndex) || slideIndex < 1) return toErrorImage("slide_required");
+    const postId = normalizeId(postIdRaw);
+    const supabase = createSupabaseServerClient();
 
-  const postId = normalizeId(postIdRaw);
-  const supabase = createSupabaseServerClient();
+    const { data: post, error: postError } = await supabase
+      .from("posts")
+      .select("id,slide_count,pillar_id,template_id,job_id,jobs(template_id)")
+      .eq("id", postIdRaw)
+      .single();
+    if (postError || !post) return toErrorImage("post_not_found");
 
-  const { data: post, error: postError } = await supabase
-    .from("posts")
-    .select("id,slide_count,pillar_id,template_id,job_id,jobs(template_id)")
-    .eq("id", postIdRaw)
-    .single();
-  if (postError || !post) return toErrorImage("post_not_found");
+    const { data: pillar } = await supabase
+      .from("pillars")
+      .select("id,template_id")
+      .eq("id", post.pillar_id)
+      .single();
 
-  const { data: pillar } = await supabase
-    .from("pillars")
-    .select("id,template_id")
-    .eq("id", post.pillar_id)
-    .single();
+    const jobTemplateId = Array.isArray(post.jobs) ? post.jobs[0]?.template_id : (post.jobs as any)?.template_id;
+    const preferredTemplateId = post.template_id || jobTemplateId || pillar?.template_id;
+    if (!preferredTemplateId) return toErrorImage("template_not_assigned");
 
-  const jobTemplateId = Array.isArray(post.jobs) ? post.jobs[0]?.template_id : (post.jobs as any)?.template_id;
-  const preferredTemplateId = post.template_id || jobTemplateId || pillar?.template_id;
-  if (!preferredTemplateId) return toErrorImage("template_not_assigned");
+    const { data: template, error: templateError } = await supabase
+      .from("templates")
+      .select("id,format,template_pack_url,manifest_json,template_hash,status")
+      .eq("id", preferredTemplateId)
+      .single();
 
-  const { data: template, error: templateError } = await supabase
-    .from("templates")
-    .select("id,format,template_pack_url,manifest_json,template_hash,status")
-    .eq("id", preferredTemplateId)
-    .single();
+    if (templateError || !template?.id) return toErrorImage("template_not_found");
+    if (template.format !== "C") return toErrorImage("template_format_not_supported");
+    if (!template.template_pack_url || !template.manifest_json) return toErrorImage("template_pack_missing");
 
-  if (templateError || !template?.id) return toErrorImage("template_not_found");
-  if (template.format !== "C") return toErrorImage("template_format_not_supported");
-  if (!template.template_pack_url || !template.manifest_json) return toErrorImage("template_pack_missing");
+    const { data: slides } = await supabase
+      .from("slides")
+      .select("slide_index,fields")
+      .eq("post_id", postIdRaw)
+      .order("slide_index", { ascending: true });
 
-  const { data: slides } = await supabase
-    .from("slides")
-    .select("slide_index,fields")
-    .eq("post_id", postIdRaw)
-    .order("slide_index", { ascending: true });
+    const slideCount = post.slide_count || slides?.length || 0;
+    if (!slideCount) return toErrorImage("slides_missing");
+    if (slideIndex > slideCount) return toErrorImage("slide_out_of_range");
 
-  const slideCount = post.slide_count || slides?.length || 0;
-  if (!slideCount) return toErrorImage("slides_missing");
-  if (slideIndex > slideCount) return toErrorImage("slide_out_of_range");
+    const payloads = (slides || []).map((slide: any) => ({
+      slide_index: slide.slide_index,
+      slide_count: slideCount,
+      fields: (slide.fields || {}) as Record<string, unknown>
+    }));
 
-  const payloads = (slides || []).map((slide: any) => ({
-    slide_index: slide.slide_index,
-    slide_count: slideCount,
-    fields: (slide.fields || {}) as Record<string, unknown>
-  }));
+    const output = template.manifest_json?.output;
+    const payloadHash = createHash("sha256")
+      .update(
+        JSON.stringify({
+          renderVersion: "v20",
+          templateHash: template.template_hash || template.template_pack_url,
+          payloads,
+          output
+        })
+      )
+      .digest("hex");
+    const safeHash = payloadHash;
+    const repoRoot = getRepoRoot();
+    const cacheDir = path.join(repoRoot, ".cache", "queue-previews", postId, safeHash);
+    const format = output?.format === "png" ? "png" : "jpeg";
+    const ext = format === "png" ? "png" : "jpg";
+    const filename = `slide_${String(slideIndex).padStart(2, "0")}.${ext}`;
+    const filePath = path.join(cacheDir, filename);
+    const mime = format === "png" ? "image/png" : "image/jpeg";
 
-  const output = template.manifest_json?.output;
-  const payloadHash = createHash("sha256")
-    .update(
-      JSON.stringify({
-        renderVersion: "v20",
-        templateHash: template.template_hash || template.template_pack_url,
-        payloads,
-        output
+    const cached = await readFileIfExists(filePath);
+    if (cached) {
+      return new NextResponse(cached, {
+        headers: {
+          "content-type": mime,
+          "cache-control": "no-store"
+        }
+      });
+    }
+
+    await fs.mkdir(cacheDir, { recursive: true });
+
+    const zipPayload = await fetchTemplateZip({
+      templatePackUrl: template.template_pack_url,
+      supabase
+    });
+    if (!zipPayload) return toErrorImage("template_pack_fetch_failed");
+
+    const { zip, templateHash } = zipPayload;
+
+    const buffers = await renderFormatCPostSlides({
+      manifest: template.manifest_json,
+      templateHash,
+      zip,
+      payloads
+    });
+
+    await Promise.all(
+      buffers.map(async (buffer, index) => {
+        const slideNumber = index + 1;
+        const slideFile = path.join(cacheDir, `slide_${String(slideNumber).padStart(2, "0")}.${ext}`);
+        await fs.writeFile(slideFile, buffer);
       })
-    )
-    .digest("hex");
-  const safeHash = payloadHash;
-  const repoRoot = getRepoRoot();
-  const cacheDir = path.join(repoRoot, ".cache", "queue-previews", postId, safeHash);
-  const format = output?.format === "png" ? "png" : "jpeg";
-  const ext = format === "png" ? "png" : "jpg";
-  const filename = `slide_${String(slideIndex).padStart(2, "0")}.${ext}`;
-  const filePath = path.join(cacheDir, filename);
-  const mime = format === "png" ? "image/png" : "image/jpeg";
+    );
 
-  const cached = await readFileIfExists(filePath);
-  if (cached) {
-    return new NextResponse(cached, {
+    const rendered = await readFileIfExists(filePath);
+    if (!rendered) return toErrorImage("render_failed");
+
+    return new NextResponse(rendered, {
       headers: {
         "content-type": mime,
         "cache-control": "no-store"
       }
     });
+  } catch (err: any) {
+    const message = err?.message ? String(err.message) : "preview_failed";
+    console.error("[queue-preview] failed", err);
+    return toErrorImage(message);
   }
-
-  await fs.mkdir(cacheDir, { recursive: true });
-
-  const zipPayload = await fetchTemplateZip({
-    templatePackUrl: template.template_pack_url,
-    supabase
-  });
-  if (!zipPayload) return toErrorImage("template_pack_fetch_failed");
-
-  const { zip, templateHash } = zipPayload;
-
-  const buffers = await renderFormatCPostSlides({
-    manifest: template.manifest_json,
-    templateHash,
-    zip,
-    payloads
-  });
-
-  await Promise.all(
-    buffers.map(async (buffer, index) => {
-      const slideNumber = index + 1;
-      const slideFile = path.join(cacheDir, `slide_${String(slideNumber).padStart(2, "0")}.${ext}`);
-      await fs.writeFile(slideFile, buffer);
-    })
-  );
-
-  const rendered = await readFileIfExists(filePath);
-  if (!rendered) return toErrorImage("render_failed");
-
-  return new NextResponse(rendered, {
-    headers: {
-      "content-type": mime,
-      "cache-control": "no-store"
-    }
-  });
 }

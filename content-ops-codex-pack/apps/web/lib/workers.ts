@@ -29,13 +29,19 @@ function shellQuote(value: string) {
   return `'${String(value).replace(/'/g, `'\"'\"'`)}'`;
 }
 
+function isProductionRuntime() {
+  const appEnv = String(process.env.APP_ENV || process.env.NODE_ENV || "").trim().toLowerCase();
+  return appEnv === "production" || Boolean(process.env.VERCEL);
+}
+
 function isUiWorkerTriggerEnabled() {
   const explicit = String(process.env.ENABLE_UI_WORKER_TRIGGER || "").trim();
   if (explicit) return parseTruthy(explicit, false);
-  return !Boolean(process.env.VERCEL);
+  return true;
 }
 
 function useWorkerControlQueue() {
+  if (isProductionRuntime()) return true;
   const mode = String(process.env.UI_WORKER_TRIGGER_MODE || "").trim().toLowerCase();
   if (mode === "queue") return true;
   if (mode === "spawn") return false;
@@ -43,6 +49,7 @@ function useWorkerControlQueue() {
 }
 
 function allowSpawnFallback() {
+  if (isProductionRuntime()) return false;
   return parseTruthy(process.env.UI_WORKER_TRIGGER_SPAWN_FALLBACK, true);
 }
 
@@ -128,7 +135,9 @@ async function enqueueControlJob(
 async function triggerViaControlQueue(): Promise<TriggerResult> {
   const supabase = createSupabaseServerClient();
   const scopeKey = "global";
+  const correlationId = `run_${Date.now()}_${randomUUID()}`;
   const payload = {
+    correlation_id: correlationId,
     source: "web_ui",
     requested_at: new Date().toISOString(),
     trigger: "approve_post"

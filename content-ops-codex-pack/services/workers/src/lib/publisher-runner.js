@@ -10,6 +10,16 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function logStructured(logger, event, fields = {}) {
+  logger.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event,
+      ...fields
+    })
+  );
+}
+
 function buildPublishPayload(job, post, assets) {
   const hashtags = Array.isArray(post.hashtags) ? post.hashtags.filter(Boolean) : [];
   const caption = [String(post.caption || "").trim(), hashtags.join(" ").trim()].filter(Boolean).join("\n\n");
@@ -167,7 +177,7 @@ async function markPostPublishedIds(supabase, post, platform, publishedInfo) {
   }
 }
 
-async function handlePublishJob({ supabase, publishJob, dryRun }) {
+async function handlePublishJob({ supabase, publishJob, dryRun, runId }) {
   const { post, assets } = await fetchPostWithAssets(supabase, publishJob.post_id);
   const payload = buildPublishPayload(publishJob, post, assets);
   const publishedInfo = await publishForPlatform({
@@ -189,6 +199,7 @@ async function handlePublishJob({ supabase, publishJob, dryRun }) {
     post_id: post.id,
     type: "PUBLISH_SUCCESS",
     payload: {
+      run_id: runId || null,
       publish_job_id: publishJob.id,
       platform: publishJob.platform,
       published: publishedInfo
@@ -196,7 +207,7 @@ async function handlePublishJob({ supabase, publishJob, dryRun }) {
   });
 }
 
-async function handlePublishError({ supabase, publishJob, err }) {
+async function handlePublishError({ supabase, publishJob, err, runId }) {
   const message = String(err?.message || err || "publish_failed");
   const rawCode = String(err?.code || "").trim();
   const errorCode = (rawCode || message.split(":")[0] || "PUBLISH_FAILED").toUpperCase();
@@ -217,6 +228,7 @@ async function handlePublishError({ supabase, publishJob, err }) {
     post_id: publishJob.post_id,
     type: "PUBLISH_FAILED",
     payload: {
+      run_id: runId || null,
       publish_job_id: publishJob.id,
       platform: publishJob.platform,
       error_code: errorCode,
@@ -239,32 +251,44 @@ export async function runPublisherOnce({
   supabase,
   workerId = defaultPublishWorkerId(),
   dryRun = resolveDryRun(),
-  logger = console
+  logger = console,
+  runId = null
 }) {
+  const effectiveRunId = runId || `run_publish_${Date.now()}_${workerId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
   const claimed = await claimPublishJobs({
     supabase,
     workerId
   });
 
   if (!claimed.length) {
-    logger.log("Publisher worker finished. No publish jobs claimed.");
-    return { claimed: 0, processed: 0, published: 0, failed: 0 };
+    logStructured(logger, "publisher.no_jobs_claimed", {
+      run_id: effectiveRunId,
+      worker_id: workerId
+    });
+    return { runId: effectiveRunId, claimed: 0, processed: 0, published: 0, failed: 0 };
   }
 
   let published = 0;
   let failed = 0;
   for (const publishJob of claimed) {
     try {
-      await handlePublishJob({ supabase, publishJob, dryRun });
+      await handlePublishJob({ supabase, publishJob, dryRun, runId: effectiveRunId });
       published += 1;
     } catch (err) {
-      await handlePublishError({ supabase, publishJob, err });
+      await handlePublishError({ supabase, publishJob, err, runId: effectiveRunId });
       failed += 1;
     }
   }
 
-  logger.log(`Publisher worker finished. Processed ${claimed.length} publish job(s).`);
+  logStructured(logger, "publisher.run_finished", {
+    run_id: effectiveRunId,
+    worker_id: workerId,
+    claimed: claimed.length,
+    published,
+    failed
+  });
   return {
+    runId: effectiveRunId,
     claimed: claimed.length,
     processed: claimed.length,
     published,
@@ -278,12 +302,14 @@ export async function runPublisherLoop({
   dryRun = resolveDryRun(),
   pollIntervalMs = Number.parseInt(process.env.PUBLISH_LOOP_POLL_MS || "15000", 10),
   maxIterations = Number.parseInt(process.env.PUBLISH_LOOP_MAX_ITERATIONS || "0", 10),
-  logger = console
+  logger = console,
+  runId = null
 }) {
-  const summary = { iterations: 0, claimed: 0, processed: 0, published: 0, failed: 0 };
+  const effectiveRunId = runId || `run_publish_loop_${Date.now()}_${workerId.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+  const summary = { runId: effectiveRunId, iterations: 0, claimed: 0, processed: 0, published: 0, failed: 0 };
   while (true) {
     if (maxIterations > 0 && summary.iterations >= maxIterations) break;
-    const cycle = await runPublisherOnce({ supabase, workerId, dryRun, logger });
+    const cycle = await runPublisherOnce({ supabase, workerId, dryRun, logger, runId: effectiveRunId });
     summary.iterations += 1;
     summary.claimed += cycle.claimed;
     summary.processed += cycle.processed;
@@ -293,4 +319,3 @@ export async function runPublisherLoop({
   }
   return summary;
 }
-

@@ -10,7 +10,7 @@
     "supervisor": "node ./src/control-supervisor.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "@supabase/supabase-js": "^2.48.0"
+    "dotenv": "16.4.7",
+    "@supabase/supabase-js": "2.48.0"
   }
 }

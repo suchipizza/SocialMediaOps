@@ -268,9 +268,9 @@ export async function ingestGoogleSheetToJob(params: {
         }
       }
 
-      if (slideIndex === slideCount) {
-        fields = {};
-      } else if (!("page_number" in fields)) {
+      // Keep slide 10 optional: if empty, fields remain empty and template defaults are preserved.
+      // For non-final slides, inject page_number only when not explicitly provided.
+      if (slideIndex !== slideCount && !("page_number" in fields)) {
         fields.page_number = `${slideIndex}/${slideCount}`;
       }
 

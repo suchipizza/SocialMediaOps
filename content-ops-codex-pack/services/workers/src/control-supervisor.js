@@ -1,10 +1,12 @@
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 import {
   claimWorkerControlJobs,
   CONTROL_JOB_TYPES,
   markWorkerControlJobFailed,
   markWorkerControlJobRunning,
-  markWorkerControlJobSucceeded
+  markWorkerControlJobSucceeded,
+  touchWorkerControlJobRunning
 } from "./lib/control-jobs.js";
 import { createSupabaseAdminClient, loadWorkerEnv } from "./lib/runtime.js";
 import { runRendererUntilDrained } from "./lib/renderer-runner.js";
@@ -25,6 +27,14 @@ const supervisorId = process.env.WORKER_SUPERVISOR_ID || `control:${os.hostname(
 const supervisorLockKey = process.env.WORKER_SUPERVISOR_LOCK_KEY || "control:supervisor:singleton";
 const supervisorLeaseSeconds = Number.parseInt(process.env.WORKER_SUPERVISOR_LEASE_SECONDS || "600", 10);
 const controlPollMs = Number.parseInt(process.env.WORKER_CONTROL_POLL_MS || "5000", 10);
+const controlJobKeepaliveMs = Math.max(
+  Number.parseInt(process.env.WORKER_CONTROL_JOB_KEEPALIVE_MS || "30000", 10) || 30_000,
+  5_000
+);
+const controlJobKeepaliveFailureThreshold = Math.max(
+  Number.parseInt(process.env.WORKER_CONTROL_JOB_KEEPALIVE_FAILURE_THRESHOLD || "3", 10) || 3,
+  1
+);
 const heartbeatCleanupIntervalMs = Number.parseInt(process.env.WORKER_HEARTBEAT_CLEANUP_INTERVAL_MS || "900000", 10);
 const heartbeatRetentionDays = Number.parseInt(process.env.WORKER_HEARTBEAT_RETENTION_DAYS || "7", 10);
 let publisherLoopEnabled =
@@ -32,6 +42,29 @@ let publisherLoopEnabled =
 let lastHeartbeatCleanupMs = 0;
 let shouldExit = false;
 let shutdownInProgress = false;
+
+function logSupervisor(event, fields = {}) {
+  console.log(
+    JSON.stringify({
+      timestamp: new Date().toISOString(),
+      event,
+      supervisor_id: supervisorId,
+      ...fields
+    })
+  );
+}
+
+function resolveControlRunId(controlJob) {
+  const payloadRunId =
+    controlJob?.payload &&
+    typeof controlJob.payload === "object" &&
+    controlJob.payload.correlation_id
+      ? String(controlJob.payload.correlation_id)
+      : "";
+  if (payloadRunId) return payloadRunId;
+  if (controlJob?.id) return `run_control_${controlJob.id}`;
+  return `run_control_${Date.now()}_${randomUUID()}`;
+}
 
 async function markSupersededSupervisorsStopped({ supabase }) {
   const hostname = os.hostname();
@@ -55,15 +88,26 @@ async function markSupersededSupervisorsStopped({ supabase }) {
   }
 }
 
-async function runControlJob({ supabase, controlJob }) {
+async function runControlJob({ supabase, controlJob, runId }) {
   if (controlJob.type === CONTROL_JOB_TYPES.RUN_RENDERER_DRAIN) {
-    return runRendererUntilDrained({ supabase });
+    const payloadPartition =
+      controlJob?.payload && typeof controlJob.payload.partition_key === "string"
+        ? String(controlJob.payload.partition_key).trim()
+        : "";
+    const partitionKey = payloadPartition || String(controlJob.scope_key || "").trim() || "global";
+    return runRendererUntilDrained({
+      supabase,
+      workerId: `${supervisorId}:renderer`,
+      partitionKey,
+      runId
+    });
   }
   if (controlJob.type === CONTROL_JOB_TYPES.RUN_PUBLISHER_ONCE) {
     return runPublisherOnce({
       supabase,
       workerId: `${supervisorId}:publisher-once`,
-      dryRun: resolveDryRun()
+      dryRun: resolveDryRun(),
+      runId
     });
   }
   if (controlJob.type === CONTROL_JOB_TYPES.RUN_PUBLISHER_LOOP_START) {
@@ -79,7 +123,14 @@ async function runControlJob({ supabase, controlJob }) {
 
 async function processClaimedControlJobs({ supabase, claimed }) {
   for (const claimedJob of claimed) {
+    const runId = resolveControlRunId(claimedJob);
+    let runningJob = claimedJob;
     try {
+      logSupervisor("control_job.started", {
+        run_id: runId,
+        control_job_id: claimedJob.id,
+        control_job_type: claimedJob.type
+      });
       await touchWorkerHeartbeat({
         supabase,
         workerId: supervisorId,
@@ -91,28 +142,104 @@ async function processClaimedControlJobs({ supabase, claimed }) {
           current_control_job_type: claimedJob.type
         }
       });
-      const runningJob = await markWorkerControlJobRunning({
+      runningJob = await markWorkerControlJobRunning({
         supabase,
         job: claimedJob,
         workerId: supervisorId
       });
-      const result = await runControlJob({ supabase, controlJob: runningJob });
+      let keepaliveFailures = 0;
+      let keepaliveFatalError = null;
+      const keepaliveTick = async () => {
+        if (keepaliveFatalError) return;
+        try {
+          const lease = await renewSupervisorLease({ supabase });
+          if (!lease.acquired) {
+            throw new Error(`singleton_guard_lost_to_${lease.holderId || "unknown"}`);
+          }
+          await touchWorkerControlJobRunning({
+            supabase,
+            jobId: runningJob.id,
+            workerId: supervisorId
+          });
+          await touchWorkerHeartbeat({
+            supabase,
+            workerId: supervisorId,
+            workerType: WORKER_HEARTBEAT_TYPE.SUPERVISOR,
+            status: WORKER_HEARTBEAT_STATUS.RUNNING,
+            metadata: {
+              publisher_loop_enabled: publisherLoopEnabled,
+              current_control_job_id: runningJob.id,
+              current_control_job_type: runningJob.type,
+              current_run_id: runId
+            }
+          });
+          keepaliveFailures = 0;
+        } catch (err) {
+          keepaliveFailures += 1;
+          const message = String(err?.message || err || "control_job_keepalive_failed");
+          logSupervisor("control_job.keepalive_failed", {
+            run_id: runId,
+            control_job_id: runningJob.id,
+            control_job_type: runningJob.type,
+            failure_count: keepaliveFailures,
+            error_message: message
+          });
+          if (keepaliveFailures >= controlJobKeepaliveFailureThreshold) {
+            keepaliveFatalError = new Error(message);
+          }
+        }
+      };
+
+      await keepaliveTick();
+      if (keepaliveFatalError) {
+        throw keepaliveFatalError;
+      }
+
+      const keepaliveTimer = setInterval(() => {
+        void keepaliveTick();
+      }, controlJobKeepaliveMs);
+      if (typeof keepaliveTimer.unref === "function") {
+        keepaliveTimer.unref();
+      }
+
+      let result;
+      try {
+        result = await runControlJob({ supabase, controlJob: runningJob, runId });
+      } finally {
+        clearInterval(keepaliveTimer);
+      }
+      if (keepaliveFatalError) {
+        throw keepaliveFatalError;
+      }
+
       await markWorkerControlJobSucceeded({
         supabase,
         jobId: runningJob.id,
         result:
           result && typeof result === "object"
-            ? { ...result, supervisor_id: supervisorId }
-            : { value: result, supervisor_id: supervisorId }
+            ? { ...result, run_id: runId, supervisor_id: supervisorId }
+            : { value: result, run_id: runId, supervisor_id: supervisorId }
+      });
+      logSupervisor("control_job.succeeded", {
+        run_id: runId,
+        control_job_id: runningJob.id,
+        control_job_type: runningJob.type
       });
     } catch (err) {
       const message = String(err?.message || err || "worker_control_job_failed");
       const code = (message.split(":")[0] || "WORKER_CONTROL_JOB_FAILED").toUpperCase();
       await markWorkerControlJobFailed({
         supabase,
-        job: claimedJob,
+        job: runningJob,
         errorCode: code,
         errorMessage: message
+      });
+      logSupervisor("control_job.failed", {
+        run_id: runId,
+        control_job_id: claimedJob.id,
+        control_job_type: claimedJob.type,
+        error_code: code,
+        error_message: message
       });
       try {
         await touchWorkerHeartbeat({
@@ -129,6 +256,14 @@ async function processClaimedControlJobs({ supabase, claimed }) {
         });
       } catch {
         // Best-effort heartbeat update only.
+      }
+      if (message.startsWith("singleton_guard_lost_to_")) {
+        await stopSupervisor({
+          supabase,
+          reason: message,
+          exitCode: 0
+        });
+        return;
       }
     }
   }

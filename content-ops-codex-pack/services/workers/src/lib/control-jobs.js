@@ -89,6 +89,30 @@ export async function markWorkerControlJobSucceeded({
   }
 }
 
+export async function touchWorkerControlJobRunning({
+  supabase,
+  jobId,
+  workerId
+}) {
+  const nowIso = asIso(new Date());
+  const { data, error } = await supabase
+    .from("worker_control_jobs")
+    .update({
+      claimed_at: nowIso
+    })
+    .eq("id", jobId)
+    .eq("status", CONTROL_JOB_STATUS.RUNNING)
+    .eq("claimed_by", workerId)
+    .select("id")
+    .maybeSingle();
+  if (error) {
+    throw new Error(`worker_control_jobs_touch_running_failed:${error.message}`);
+  }
+  if (!data?.id) {
+    throw new Error("worker_control_jobs_touch_running_lost_claim");
+  }
+}
+
 export async function markWorkerControlJobFailed({
   supabase,
   job,
@@ -148,4 +172,3 @@ export async function enqueueWorkerControlJob({
   }
   return data;
 }
-

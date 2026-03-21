@@ -1,5 +1,7 @@
 import JSZip from "jszip";
 import { createHash, randomUUID } from "node:crypto";
+import path from "node:path";
+import fs from "node:fs/promises";
 import { createSupabaseServerClient, getSupabaseStorageBucket } from "./supabase";
 import { validateManifest } from "./manifest";
 import { generateTemplatePreview } from "./template-preview";
@@ -62,6 +64,86 @@ function buildDefaultFormatCManifest() {
     slide_count: 10,
     render: { mode: "querystring", query: { slide: "slide", data: "data" }, capture: "auto" }
   };
+}
+
+function getRepoRoot() {
+  const cwd = process.cwd();
+  if (cwd.endsWith(`${path.sep}apps${path.sep}web`)) {
+    return path.resolve(cwd, "../..");
+  }
+  return cwd;
+}
+
+async function resolveFormatCBuiltOutputDir(templateHash: string) {
+  const repoRoot = getRepoRoot();
+  const buildRoot = path.join(repoRoot, ".cache", "template-builds", templateHash);
+  const candidates = [
+    path.join(buildRoot, "dist"),
+    path.join(buildRoot, "build")
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const stat = await fs.stat(path.join(candidate, "index.html"));
+      if (stat.isFile()) {
+        return candidate;
+      }
+    } catch {
+      // continue
+    }
+  }
+
+  throw new Error("format_c_render_pack_missing_output");
+}
+
+async function addDirectoryToZip({
+  zip,
+  sourceDir,
+  prefix
+}: {
+  zip: JSZip;
+  sourceDir: string;
+  prefix: string;
+}) {
+  const entries = await fs.readdir(sourceDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const absPath = path.join(sourceDir, entry.name);
+    const relPath = `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) {
+      await addDirectoryToZip({ zip, sourceDir: absPath, prefix: relPath });
+      continue;
+    }
+    const fileBuffer = await fs.readFile(absPath);
+    zip.file(relPath, fileBuffer);
+  }
+}
+
+async function buildFormatCRenderPackFromCache(templateHash: string) {
+  const outputDir = await resolveFormatCBuiltOutputDir(templateHash);
+  const outputRootName = path.basename(outputDir);
+  const outZip = new JSZip();
+  await addDirectoryToZip({
+    zip: outZip,
+    sourceDir: outputDir,
+    prefix: outputRootName
+  });
+  outZip.file(
+    "render_bundle.json",
+    JSON.stringify(
+      {
+        built_at: new Date().toISOString(),
+        bundle_type: "format_c_prebuilt_dist",
+        output_root: outputRootName
+      },
+      null,
+      2
+    )
+  );
+  return outZip.generateAsync({
+    type: "nodebuffer",
+    compression: "DEFLATE",
+    compressionOptions: { level: 9 }
+  });
 }
 
 export async function createTemplateFromZip(params: {
@@ -159,9 +241,40 @@ export async function createTemplateFromZip(params: {
         zip
       });
 
+      let finalTemplatePackUrl = templatePackUrl;
+      let finalTemplateHash = templateHash;
+      let oldStoragePathToDelete: string | null = null;
+
+      if (templateFormat === "C") {
+        let renderPackBuffer: Buffer;
+        try {
+          renderPackBuffer = await buildFormatCRenderPackFromCache(templateHash);
+        } catch (err: any) {
+          throw new Error(`format_c_render_pack_build_failed:${err?.message || String(err)}`);
+        }
+
+        const renderPackStoragePath = `template-packs/${randomUUID()}-render.zip`;
+        const { error: renderPackUploadError } = await supabase.storage
+          .from(bucket)
+          .upload(renderPackStoragePath, renderPackBuffer, {
+            contentType: "application/zip",
+            upsert: false
+          });
+        if (renderPackUploadError) {
+          throw new Error(`storage_upload_failed:${renderPackUploadError.message}`);
+        }
+
+        const { data: renderPackPublicData } = supabase.storage.from(bucket).getPublicUrl(renderPackStoragePath);
+        finalTemplatePackUrl = renderPackPublicData.publicUrl;
+        finalTemplateHash = createHash("sha256").update(renderPackBuffer).digest("hex");
+        oldStoragePathToDelete = storagePath;
+      }
+
       await supabase
         .from("templates")
         .update({
+          template_pack_url: finalTemplatePackUrl,
+          template_hash: finalTemplateHash,
           preview_assets: previewAssets,
           manifest_json: manifest,
           status: "VALID",
@@ -169,6 +282,11 @@ export async function createTemplateFromZip(params: {
           preview_generated_at: new Date().toISOString()
         })
         .eq("id", data.id);
+      if (oldStoragePathToDelete) {
+        await supabase.storage.from(bucket).remove([oldStoragePathToDelete]).catch(() => {});
+      }
+      data.template_pack_url = finalTemplatePackUrl;
+      data.template_hash = finalTemplateHash;
       data.preview_assets = previewAssets;
       data.status = "VALID";
     } catch (err: any) {

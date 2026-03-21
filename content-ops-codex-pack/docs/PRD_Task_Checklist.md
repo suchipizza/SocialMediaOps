@@ -68,16 +68,16 @@ _Last updated: 2026-03-10_
   - [x] show recent run history + error summaries.
 - [x] Add worker heartbeat + liveness model (`worker_heartbeats` table or equivalent) with stale-worker detection.
 - [ ] Add idempotency and concurrency guards:
-  - [ ] one active render worker per queue partition,
+  - [x] one active render worker per queue partition,
   - [x] safe claim/reclaim for stuck jobs (`claim_worker_control_jobs`, publish stale-claim handling),
   - [x] dedupe on control job idempotency keys / active scope guard.
 - [ ] Add robust retry/backoff policy config:
-  - [ ] renderer retries only on transient failures,
+  - [x] renderer retries only on transient failures,
   - [x] publisher retry windows + max attempts + dead-letter status (`FAILED_FINAL`).
 - [ ] Add structured observability:
-  - [ ] per-run correlation IDs,
+  - [x] per-run correlation IDs,
   - [x] run status/result persisted to DB (`worker_control_jobs`, `events_log`) and stdout logs available for worker runtime,
-  - [ ] alert thresholds for repeated failures.
+  - [x] alert thresholds for repeated failures.
 - [ ] Add secrets strategy:
   - keep Supabase + platform secrets in Fly secrets/Vercel env,
   - remove reliance on local `.env` for production execution.
@@ -89,8 +89,8 @@ _Last updated: 2026-03-10_
 ### Scheduling + Operations Hardening
 - [ ] Run publisher continuously on Fly (short poll interval) so scheduled posts publish without manual terminal commands.
 - [x] Keep renderer in drain mode on control trigger (no long-running renderer loop).
-- [ ] Add explicit "requeue failed publish jobs" bulk action in UI with audit event.
-- [ ] Add timezone/schedule validation in UI with explicit UTC preview before saving project/job settings.
+- [x] Add explicit "requeue failed publish jobs" bulk action in UI with audit event.
+- [x] Add timezone/schedule validation in UI with explicit UTC preview before saving project/job settings.
 
 ### Security / Isolation
 - [ ] Build/render Format C in a sandbox or container.

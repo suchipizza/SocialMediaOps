@@ -1,19 +1,10 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "../../../lib/supabase";
-
-function parseSlotTimes(input: unknown) {
-  if (!input) return ["09:00", "13:00", "18:00"];
-  if (Array.isArray(input)) {
-    return input.map(String).filter(Boolean);
-  }
-  if (typeof input === "string") {
-    return input
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean);
-  }
-  return ["09:00", "13:00", "18:00"];
-}
+import {
+  buildUtcSchedulePreview,
+  isValidTimezone,
+  parseSlotTimesWithValidation
+} from "../../../lib/schedule-validation";
 
 export async function GET() {
   const supabase = createSupabaseServerClient();
@@ -41,6 +32,27 @@ export async function POST(request: Request) {
   if (!name) {
     return NextResponse.json({ error: "name_required" }, { status: 400 });
   }
+  const timezone = String(payload.timezone || "Europe/Zurich").trim() || "Europe/Zurich";
+  if (!isValidTimezone(timezone)) {
+    return NextResponse.json({ error: `invalid_timezone:${timezone}` }, { status: 400 });
+  }
+  const { slotTimes, invalid } = parseSlotTimesWithValidation(payload.slot_times);
+  if (invalid.length) {
+    return NextResponse.json({ error: `invalid_slot_times:${invalid.join(",")}` }, { status: 400 });
+  }
+  try {
+    buildUtcSchedulePreview({
+      startDate: new Date().toISOString().slice(0, 10),
+      timezone,
+      slotTimes,
+      previewCount: 3
+    });
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: error?.message || "project_schedule_preview_invalid" },
+      { status: 400 }
+    );
+  }
 
   const supabase = createSupabaseServerClient();
   const { data, error } = await supabase
@@ -48,9 +60,9 @@ export async function POST(request: Request) {
     .insert({
       name,
       description: payload.description || null,
-      timezone: payload.timezone || "Europe/Zurich",
+      timezone,
       platforms_enabled: payload.platforms_enabled || { instagram: true, tiktok: false },
-      slot_times: parseSlotTimes(payload.slot_times)
+      slot_times: slotTimes
     })
     .select()
     .single();

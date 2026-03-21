@@ -5,19 +5,60 @@ import fs from "node:fs/promises";
 import { createSupabaseServerClient, getSupabaseStorageBucket } from "../../lib/supabase";
 import { applyScheduleForProjectJobs } from "../../lib/scheduling";
 import { cleanupStalePostArtifacts } from "../../lib/cleanup";
+import { ScheduleUtcPreview } from "../components/schedule-utc-preview";
+import {
+  buildUtcSchedulePreview,
+  isValidTimezone,
+  parseSlotTimesWithValidation
+} from "../../lib/schedule-validation";
 
 function normalizeAccountId(value: FormDataEntryValue | null) {
   const parsed = String(value || "").trim();
   return parsed || null;
 }
 
-function parseSlotTimes(input: FormDataEntryValue | null | undefined) {
-  const parsed = String(input || "09:00,13:00,18:00")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
-  const valid = parsed.filter(value => /^([01]\d|2[0-3]):[0-5]\d$/.test(value));
-  return valid.length ? valid : ["09:00", "13:00", "18:00"];
+const FALLBACK_TIMEZONES = [
+  "Europe/Zurich",
+  "UTC",
+  "Europe/London",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "Europe/Madrid",
+  "Europe/Rome",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "America/Toronto",
+  "America/Sao_Paulo",
+  "Asia/Dubai",
+  "Asia/Singapore",
+  "Asia/Tokyo",
+  "Australia/Sydney"
+];
+
+function getTimezoneOptions() {
+  const intlWithSupported = Intl as unknown as {
+    supportedValuesOf?: (key: string) => string[];
+  };
+  const supported = intlWithSupported.supportedValuesOf?.("timeZone");
+  if (Array.isArray(supported) && supported.length) {
+    return [...supported].sort((a, b) => a.localeCompare(b));
+  }
+  return [...FALLBACK_TIMEZONES];
+}
+
+function getTodayIsoDate() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function validateSchedulePreviewOrThrow(timezone: string, slotTimes: string[]) {
+  buildUtcSchedulePreview({
+    startDate: getTodayIsoDate(),
+    timezone,
+    slotTimes,
+    previewCount: 3
+  });
 }
 
 function parseJsonObject(raw: unknown): Record<string, unknown> {
@@ -223,8 +264,8 @@ async function createProject(formData: FormData) {
   "use server";
   const name = String(formData.get("name") || "").trim();
   const description = String(formData.get("description") || "").trim();
-  const timezone = String(formData.get("timezone") || "Europe/Zurich").trim();
-  const slotTimes = parseSlotTimes(formData.get("slot_times"));
+  const timezone = String(formData.get("timezone") || "Europe/Zurich").trim() || "Europe/Zurich";
+  const { slotTimes, invalid } = parseSlotTimesWithValidation(formData.get("slot_times"));
   const platformsEnabled = {
     instagram: formData.get("platform_instagram") === "on",
     tiktok: formData.get("platform_tiktok") === "on"
@@ -234,6 +275,17 @@ async function createProject(formData: FormData) {
 
   if (!name) {
     return;
+  }
+  if (!isValidTimezone(timezone)) {
+    redirect(`/projects?error=${encodeURIComponent(`invalid_timezone:${timezone}`)}`);
+  }
+  if (invalid.length) {
+    redirect(`/projects?error=${encodeURIComponent(`invalid_slot_times:${invalid.join(",")}`)}`);
+  }
+  try {
+    validateSchedulePreviewOrThrow(timezone, slotTimes);
+  } catch (error: any) {
+    redirect(`/projects?error=${encodeURIComponent(error?.message || "project_schedule_preview_invalid")}`);
   }
 
   const supabase = createSupabaseServerClient();
@@ -270,11 +322,22 @@ async function updateProjectSettings(formData: FormData) {
   const projectId = String(formData.get("project_id") || "").trim();
   const name = String(formData.get("name") || "").trim();
   const description = String(formData.get("description") || "").trim();
-  const timezone = String(formData.get("timezone") || "").trim();
-  const slotTimes = parseSlotTimes(formData.get("slot_times"));
+  const timezone = String(formData.get("timezone") || "").trim() || "Europe/Zurich";
+  const { slotTimes, invalid } = parseSlotTimesWithValidation(formData.get("slot_times"));
 
   if (!projectId || !name) {
     redirect("/projects?error=project_id_and_name_required");
+  }
+  if (!isValidTimezone(timezone)) {
+    redirect(`/projects?error=${encodeURIComponent(`invalid_timezone:${timezone}`)}`);
+  }
+  if (invalid.length) {
+    redirect(`/projects?error=${encodeURIComponent(`invalid_slot_times:${invalid.join(",")}`)}`);
+  }
+  try {
+    validateSchedulePreviewOrThrow(timezone, slotTimes);
+  } catch (error: any) {
+    redirect(`/projects?error=${encodeURIComponent(error?.message || "project_schedule_preview_invalid")}`);
   }
 
   const supabase = createSupabaseServerClient();
@@ -283,7 +346,7 @@ async function updateProjectSettings(formData: FormData) {
     .update({
       name,
       description: description || null,
-      timezone: timezone || "Europe/Zurich",
+      timezone,
       slot_times: slotTimes
     })
     .eq("id", projectId);
@@ -435,6 +498,7 @@ export default async function ProjectsPage({
 
   const instagramAccounts = (accounts || []).filter((account: any) => account.platform === "instagram");
   const tiktokAccounts = (accounts || []).filter((account: any) => account.platform === "tiktok");
+  const timezoneOptions = getTimezoneOptions();
   const linkMap = new Map<string, { instagram?: string; tiktok?: string; labels: string[] }>();
   for (const link of projectAccountLinks || []) {
     const account = Array.isArray(link.social_accounts) ? link.social_accounts[0] : link.social_accounts;
@@ -539,12 +603,23 @@ export default async function ProjectsPage({
             </div>
             <div className="field">
               <label htmlFor="timezone">Timezone</label>
-              <input id="timezone" name="timezone" defaultValue="Europe/Zurich" />
+              <select id="timezone" name="timezone" defaultValue="Europe/Zurich">
+                {timezoneOptions.map(timezone => (
+                  <option key={timezone} value={timezone}>
+                    {timezone}
+                  </option>
+                ))}
+              </select>
             </div>
             <div className="field">
               <label htmlFor="slot_times">Daily slots (comma separated)</label>
               <input id="slot_times" name="slot_times" defaultValue="09:00,13:00,18:00" />
             </div>
+            <ScheduleUtcPreview
+              title="Timezone to UTC preview"
+              timezoneInputId="timezone"
+              slotTimesInputId="slot_times"
+            />
             <div className="field">
               <label>Platforms</label>
               <label>
@@ -708,11 +783,20 @@ export default async function ProjectsPage({
                               </div>
                               <div className="field">
                                 <label htmlFor={`project_timezone_${project.id}`}>Timezone</label>
-                                <input
+                                <select
                                   id={`project_timezone_${project.id}`}
                                   name="timezone"
                                   defaultValue={project.timezone || "Europe/Zurich"}
-                                />
+                                >
+                                  {!timezoneOptions.includes(project.timezone || "") && project.timezone ? (
+                                    <option value={project.timezone}>{project.timezone}</option>
+                                  ) : null}
+                                  {timezoneOptions.map(timezone => (
+                                    <option key={timezone} value={timezone}>
+                                      {timezone}
+                                    </option>
+                                  ))}
+                                </select>
                               </div>
                               <div className="field">
                                 <label htmlFor={`project_slots_${project.id}`}>Daily slots (comma separated)</label>
@@ -722,6 +806,11 @@ export default async function ProjectsPage({
                                   defaultValue={(project.slot_times || []).join(", ") || "09:00,13:00,18:00"}
                                 />
                               </div>
+                              <ScheduleUtcPreview
+                                title="Timezone to UTC preview"
+                                timezoneInputId={`project_timezone_${project.id}`}
+                                slotTimesInputId={`project_slots_${project.id}`}
+                              />
                               <button type="submit">Save settings</button>
                             </form>
                           </details>

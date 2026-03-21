@@ -15,6 +15,19 @@ const ACTIVE_CONTROL_STATUSES = ["PENDING", "CLAIMED", "RUNNING", "FAILED_RETRYA
 const HEARTBEAT_STALE_SECONDS = Number.parseInt(process.env.WORKER_HEARTBEAT_STALE_SECONDS || "90", 10);
 const HEARTBEAT_RETENTION_DAYS = Number.parseInt(process.env.WORKER_HEARTBEAT_RETENTION_DAYS || "7", 10);
 const ACTIVE_HEARTBEAT_STATUSES = ["STARTING", "IDLE", "RUNNING", "DEGRADED"];
+const OPERATIONS_ALERT_WINDOW_MINUTES = Number.parseInt(process.env.OPERATIONS_ALERT_WINDOW_MINUTES || "60", 10);
+const OPERATIONS_ALERT_CONTROL_FAIL_THRESHOLD = Number.parseInt(
+  process.env.OPERATIONS_ALERT_CONTROL_FAIL_THRESHOLD || "3",
+  10
+);
+const OPERATIONS_ALERT_RENDER_FAIL_THRESHOLD = Number.parseInt(
+  process.env.OPERATIONS_ALERT_RENDER_FAIL_THRESHOLD || "5",
+  10
+);
+const OPERATIONS_ALERT_PUBLISH_FAIL_THRESHOLD = Number.parseInt(
+  process.env.OPERATIONS_ALERT_PUBLISH_FAIL_THRESHOLD || "5",
+  10
+);
 
 function controlTypeLabel(type: string) {
   if (type === "RUN_RENDERER_DRAIN") return "Renderer drain";
@@ -57,6 +70,14 @@ function formatAgeMs(ms: number) {
   return `${totalHr}h ${remMin}m`;
 }
 
+function extractRunId(job: any) {
+  const payloadRunId = job?.payload && typeof job.payload === "object" ? job.payload.correlation_id : null;
+  const resultRunId = job?.result_json && typeof job.result_json === "object" ? job.result_json.run_id : null;
+  const runId = payloadRunId || resultRunId;
+  if (!runId) return "—";
+  return String(runId);
+}
+
 async function enqueueControlJob(formData: FormData) {
   "use server";
   const type = String(formData.get("type") || "").trim();
@@ -86,8 +107,10 @@ async function enqueueControlJob(formData: FormData) {
   }
 
   const priority = defaultPriorityForType(type);
+  const correlationId = `run_${Date.now()}_${randomUUID()}`;
   const idempotencyKey = `${type}:${scopeKey}:${Date.now()}:${randomUUID()}`;
   const payload = {
+    correlation_id: correlationId,
     source: "operations_ui",
     requested_at: new Date().toISOString(),
     trigger: "manual_operations"
@@ -113,7 +136,7 @@ async function enqueueControlJob(formData: FormData) {
   }
 
   revalidatePath("/operations");
-  redirect(`/operations?queued=1&type=${encodeURIComponent(type)}`);
+  redirect(`/operations?queued=1&type=${encodeURIComponent(type)}&run_id=${encodeURIComponent(correlationId)}`);
 }
 
 async function cleanupHeartbeatHistory() {
@@ -145,6 +168,7 @@ export default async function OperationsPage({
   const queued = Array.isArray(params.queued) ? params.queued[0] : params.queued;
   const alreadyRunning = Array.isArray(params.already_running) ? params.already_running[0] : params.already_running;
   const queuedType = Array.isArray(params.type) ? params.type[0] : params.type;
+  const runId = Array.isArray(params.run_id) ? params.run_id[0] : params.run_id;
   const cleaned = Array.isArray(params.cleaned) ? params.cleaned[0] : params.cleaned;
   const retentionDaysParam = Array.isArray(params.retention_days) ? params.retention_days[0] : params.retention_days;
   const showStopped = (Array.isArray(params.show_stopped) ? params.show_stopped[0] : params.show_stopped) === "1";
@@ -152,7 +176,7 @@ export default async function OperationsPage({
   const supabase = createSupabaseServerClient();
   const { data: activeJobs, error: activeError } = await supabase
     .from("worker_control_jobs")
-    .select("id,type,status,scope_key,priority,attempt_count,claimed_by,claimed_at,started_at,next_retry_at,created_at")
+    .select("id,type,status,scope_key,priority,attempt_count,claimed_by,claimed_at,started_at,next_retry_at,created_at,payload")
     .in("status", ACTIVE_CONTROL_STATUSES)
     .order("priority", { ascending: false })
     .order("created_at", { ascending: false })
@@ -161,10 +185,32 @@ export default async function OperationsPage({
   const { data: recentJobs, error: historyError } = await supabase
     .from("worker_control_jobs")
     .select(
-      "id,type,status,scope_key,priority,attempt_count,max_attempts,requested_by,claimed_by,created_at,started_at,completed_at,error_code,error_message,result_json"
+      "id,type,status,scope_key,priority,attempt_count,max_attempts,requested_by,claimed_by,created_at,started_at,completed_at,error_code,error_message,result_json,payload"
     )
     .order("created_at", { ascending: false })
     .limit(80);
+
+  const alertWindowMinutes = Number.isFinite(OPERATIONS_ALERT_WINDOW_MINUTES)
+    ? Math.max(OPERATIONS_ALERT_WINDOW_MINUTES, 1)
+    : 60;
+  const alertCutoffIso = new Date(Date.now() - alertWindowMinutes * 60 * 1000).toISOString();
+  const [{ count: controlFailuresCount, error: controlFailuresError }, { count: renderFailuresCount, error: renderFailuresError }, { count: publishFailuresCount, error: publishFailuresError }] = await Promise.all([
+    supabase
+      .from("worker_control_jobs")
+      .select("id", { count: "exact", head: true })
+      .in("status", ["FAILED_RETRYABLE", "FAILED_FINAL"])
+      .gte("created_at", alertCutoffIso),
+    supabase
+      .from("events_log")
+      .select("id", { count: "exact", head: true })
+      .eq("type", "RENDER_FAILED")
+      .gte("created_at", alertCutoffIso),
+    supabase
+      .from("events_log")
+      .select("id", { count: "exact", head: true })
+      .eq("type", "PUBLISH_FAILED")
+      .gte("created_at", alertCutoffIso)
+  ]);
 
   let heartbeatsQuery = supabase
     .from("worker_heartbeats")
@@ -176,7 +222,14 @@ export default async function OperationsPage({
   }
   const { data: heartbeats, error: heartbeatsError } = await heartbeatsQuery;
 
-  const listError = activeError?.message || historyError?.message || heartbeatsError?.message || null;
+  const listError =
+    activeError?.message ||
+    historyError?.message ||
+    heartbeatsError?.message ||
+    controlFailuresError?.message ||
+    renderFailuresError?.message ||
+    publishFailuresError?.message ||
+    null;
   const nowMs = Date.now();
   const staleThresholdMs = Math.max(HEARTBEAT_STALE_SECONDS, 1) * 1000;
   const heartbeatRows = (heartbeats || []).map((row: any) => {
@@ -187,6 +240,29 @@ export default async function OperationsPage({
     return { ...row, ageMs, isStale };
   });
   const staleCount = heartbeatRows.filter((row: any) => row.isStale).length;
+  const normalizedControlFailThreshold = Number.isFinite(OPERATIONS_ALERT_CONTROL_FAIL_THRESHOLD)
+    ? Math.max(OPERATIONS_ALERT_CONTROL_FAIL_THRESHOLD, 1)
+    : 3;
+  const normalizedRenderFailThreshold = Number.isFinite(OPERATIONS_ALERT_RENDER_FAIL_THRESHOLD)
+    ? Math.max(OPERATIONS_ALERT_RENDER_FAIL_THRESHOLD, 1)
+    : 5;
+  const normalizedPublishFailThreshold = Number.isFinite(OPERATIONS_ALERT_PUBLISH_FAIL_THRESHOLD)
+    ? Math.max(OPERATIONS_ALERT_PUBLISH_FAIL_THRESHOLD, 1)
+    : 5;
+  const controlFailHits = Number(controlFailuresCount || 0);
+  const renderFailHits = Number(renderFailuresCount || 0);
+  const publishFailHits = Number(publishFailuresCount || 0);
+  const failureAlerts = [
+    controlFailHits >= normalizedControlFailThreshold
+      ? `${controlFailHits} control-job failure event(s) in the last ${alertWindowMinutes}m`
+      : null,
+    renderFailHits >= normalizedRenderFailThreshold
+      ? `${renderFailHits} render failure event(s) in the last ${alertWindowMinutes}m`
+      : null,
+    publishFailHits >= normalizedPublishFailThreshold
+      ? `${publishFailHits} publish failure event(s) in the last ${alertWindowMinutes}m`
+      : null
+  ].filter(Boolean) as string[];
 
   return (
     <div>
@@ -207,7 +283,10 @@ export default async function OperationsPage({
       {queued ? (
         <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
           <h3>Control job queued</h3>
-          <p>{controlTypeLabel(String(queuedType || "worker action"))} was enqueued successfully.</p>
+          <p>
+            {controlTypeLabel(String(queuedType || "worker action"))} was enqueued successfully.
+            {runId ? ` Run ID: ${runId}.` : ""}
+          </p>
         </div>
       ) : null}
 
@@ -226,6 +305,28 @@ export default async function OperationsPage({
           </p>
         </div>
       ) : null}
+
+      <div
+        className="card"
+        style={{
+          borderColor: failureAlerts.length ? "rgba(240, 108, 0, 0.5)" : "rgba(34, 140, 34, 0.4)"
+        }}
+      >
+        <h3>Failure alerts ({alertWindowMinutes}m window)</h3>
+        <p>
+          Control failures: {controlFailHits} (threshold {normalizedControlFailThreshold}) · Render failures: {renderFailHits} (threshold{" "}
+          {normalizedRenderFailThreshold}) · Publish failures: {publishFailHits} (threshold {normalizedPublishFailThreshold})
+        </p>
+        {failureAlerts.length ? (
+          <ul style={{ marginTop: 8, paddingLeft: 18 }}>
+            {failureAlerts.map(alert => (
+              <li key={alert}>{alert}</li>
+            ))}
+          </ul>
+        ) : (
+          <p style={{ marginTop: 8 }}>No active failure-threshold warnings.</p>
+        )}
+      </div>
 
       <div className="card" style={{ borderColor: staleCount > 0 ? "rgba(240, 108, 0, 0.5)" : "rgba(34, 140, 34, 0.4)" }}>
         <h3>Worker freshness</h3>
@@ -279,11 +380,12 @@ export default async function OperationsPage({
             <div className="table-scroll">
               <table className="table table-wide">
                 <thead>
-                  <tr>
-                    <th>Type</th>
-                    <th>Status</th>
-                    <th>Scope</th>
-                    <th>Priority</th>
+                <tr>
+                  <th>Type</th>
+                  <th>Run ID</th>
+                  <th>Status</th>
+                  <th>Scope</th>
+                  <th>Priority</th>
                     <th>Attempts</th>
                     <th>Claimed by</th>
                     <th>Created</th>
@@ -293,6 +395,7 @@ export default async function OperationsPage({
                   {(activeJobs || []).map((job: any) => (
                     <tr key={job.id}>
                       <td>{controlTypeLabel(asText(job.type, ""))}</td>
+                      <td>{extractRunId(job)}</td>
                       <td>
                         <span className="chip">{asText(job.status, "")}</span>
                       </td>
@@ -382,6 +485,7 @@ export default async function OperationsPage({
                 <tr>
                   <th>Created</th>
                   <th>Type</th>
+                  <th>Run ID</th>
                   <th>Status</th>
                   <th>Scope</th>
                   <th>Attempts</th>
@@ -396,6 +500,7 @@ export default async function OperationsPage({
                   <tr key={job.id}>
                     <td>{asText(job.created_at)}</td>
                     <td>{controlTypeLabel(asText(job.type, ""))}</td>
+                    <td>{extractRunId(job)}</td>
                     <td>
                       <span className="chip">{asText(job.status, "")}</span>
                     </td>
