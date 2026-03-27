@@ -112,7 +112,11 @@ export async function claimPublishJobs({
   const { data: candidates, error: fetchError } = await supabase
     .from("publish_jobs")
     .select("*")
-    .in("status", [PUBLISH_JOB_STATUS.PENDING, PUBLISH_JOB_STATUS.FAILED_RETRYABLE])
+    .in("status", [
+      PUBLISH_JOB_STATUS.PENDING,
+      PUBLISH_JOB_STATUS.FAILED_RETRYABLE,
+      PUBLISH_JOB_STATUS.SENDING
+    ])
     .order("scheduled_at", { ascending: true, nullsFirst: true })
     .order("created_at", { ascending: true })
     .limit(Math.max(limit * 4, limit));
@@ -121,9 +125,14 @@ export async function claimPublishJobs({
   }
 
   const due = (candidates || []).filter(row => {
+    const status = String(row.status || "");
+    const claimedAt = row.claimed_at ? new Date(row.claimed_at) : null;
+    if (status === PUBLISH_JOB_STATUS.SENDING) {
+      return Boolean(claimedAt && claimedAt <= staleThreshold);
+    }
+
     const scheduledAt = row.scheduled_at ? new Date(row.scheduled_at) : null;
     const retryAt = row.next_retry_at ? new Date(row.next_retry_at) : null;
-    const claimedAt = row.claimed_at ? new Date(row.claimed_at) : null;
     const scheduleReady = !scheduledAt || scheduledAt <= now;
     const retryReady = !retryAt || retryAt <= now;
     const claimAvailable = !claimedAt || claimedAt <= staleThreshold;

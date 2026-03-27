@@ -31,6 +31,28 @@ fly secrets set \
   IG_GRAPH_API_VERSION=v21.0
 ```
 
+Recommended for Instagram reliability (media URL proxy):
+
+```bash
+fly secrets set \
+  PUBLISH_MEDIA_PROXY_BASE_URL=https://<your-web-domain> \
+  PUBLISH_MEDIA_PROXY_SECRET=<long-random-secret> \
+  PUBLISH_MEDIA_PROXY_TTL_SECONDS=21600
+```
+
+Set the same `PUBLISH_MEDIA_PROXY_SECRET` in web production env (Vercel/Fly web) so `/api/public/assets/:assetId` can validate signed URLs.
+
+If web is on Fly and used as media-proxy origin, keep at least one web machine always running:
+
+```bash
+fly scale count 1 -a content-ops-web
+fly deploy -a content-ops-web
+```
+
+`apps/web/fly.toml` should keep:
+- `auto_stop_machines = "off"`
+- `min_machines_running = 1`
+
 Optional worker tuning:
 
 ```bash
@@ -91,6 +113,7 @@ Behavior:
    - should enqueue control jobs
    - renderer should produce assets
    - publisher should claim due publish jobs
+   - for Instagram, publish payload should use signed media-proxy URLs when proxy env vars are configured
 
 ## 5) Rollback
 

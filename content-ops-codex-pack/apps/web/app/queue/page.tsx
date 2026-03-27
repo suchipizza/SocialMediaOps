@@ -135,6 +135,129 @@ async function approvePost(formData: FormData) {
   redirect(`/queue?approved=1${triggerQuery}`);
 }
 
+async function approveAllPosts() {
+  "use server";
+  const supabase = createSupabaseServerClient();
+
+  const { data: candidatePosts, error: candidateError } = await supabase
+    .from("posts")
+    .select("id,slide_count,job_id")
+    .in("status", ["READY_FOR_REVIEW", "DRAFT"]);
+  if (candidateError) {
+    redirect(`/queue?error=${encodeURIComponent(candidateError.message)}`);
+  }
+
+  const posts = (candidatePosts || []) as Array<{ id: string; slide_count: number | null; job_id: string | null }>;
+  if (!posts.length) {
+    redirect("/queue?bulk_approved=0&bulk_skipped=0");
+  }
+
+  const jobIds = Array.from(
+    new Set(posts.map(post => post.job_id).filter((value): value is string => Boolean(value)))
+  );
+  const jobTemplateMap = new Map<string, string | null>();
+  if (jobIds.length) {
+    const { data: jobs, error: jobsError } = await supabase
+      .from("jobs")
+      .select("id,template_id")
+      .in("id", jobIds);
+    if (jobsError) {
+      redirect(`/queue?error=${encodeURIComponent(jobsError.message)}`);
+    }
+    for (const job of jobs || []) {
+      jobTemplateMap.set(String((job as any).id), (job as any).template_id ? String((job as any).template_id) : null);
+    }
+  }
+
+  const templateIds = Array.from(
+    new Set(
+      Array.from(jobTemplateMap.values()).filter((value): value is string => Boolean(value))
+    )
+  );
+  const templateSlideCountMap = new Map<string, number>();
+  if (templateIds.length) {
+    const { data: templates, error: templatesError } = await supabase
+      .from("templates")
+      .select("id,manifest_json")
+      .in("id", templateIds);
+    if (templatesError) {
+      redirect(`/queue?error=${encodeURIComponent(templatesError.message)}`);
+    }
+    for (const template of templates || []) {
+      const templateId = String((template as any).id);
+      const parsed = Number.parseInt(String((template as any)?.manifest_json?.slide_count || ""), 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        templateSlideCountMap.set(templateId, parsed);
+      }
+    }
+  }
+
+  const approvablePostIds: string[] = [];
+  let skipped = 0;
+
+  for (const post of posts) {
+    const postId = String(post.id || "");
+    if (!postId) {
+      skipped += 1;
+      continue;
+    }
+
+    const templateId = post.job_id ? jobTemplateMap.get(post.job_id) || null : null;
+    if (templateId && templateSlideCountMap.has(templateId)) {
+      const templateSlideCount = templateSlideCountMap.get(templateId)!;
+      const postSlideCount = Number.parseInt(String(post.slide_count || ""), 10);
+      if (Number.isFinite(postSlideCount) && postSlideCount > 0 && postSlideCount < templateSlideCount) {
+        skipped += 1;
+        continue;
+      }
+    }
+
+    approvablePostIds.push(postId);
+  }
+
+  if (approvablePostIds.length) {
+    const { error: approveError } = await supabase
+      .from("posts")
+      .update({ status: "APPROVED", error_code: null, error_message: null })
+      .in("id", approvablePostIds);
+    if (approveError) {
+      redirect(`/queue?error=${encodeURIComponent(approveError.message)}`);
+    }
+
+    await supabase
+      .from("posts")
+      .update({
+        render_attempt_count: 0,
+        render_next_retry_at: null,
+        render_last_attempt_at: null
+      })
+      .in("id", approvablePostIds);
+  }
+
+  let triggerQuery = "";
+  const triggerResult = await triggerRendererThenPublisher();
+  if (triggerResult.triggered) {
+    triggerQuery = "&workers_triggered=1";
+  } else if (triggerResult.reason === "already_running") {
+    triggerQuery = "&workers_triggered=0&workers_reason=already_running";
+  } else if (triggerResult.reason === "disabled") {
+    triggerQuery = "&workers_triggered=0&workers_reason=disabled";
+  } else if (triggerResult.reason === "spawn_failed") {
+    triggerQuery = `&workers_triggered=0&workers_reason=${encodeURIComponent(
+      triggerResult.message || "spawn_failed"
+    )}`;
+  } else {
+    triggerQuery = "&workers_triggered=0&workers_reason=unknown";
+  }
+
+  revalidatePath("/queue");
+  redirect(
+    `/queue?bulk_approved=${encodeURIComponent(String(approvablePostIds.length))}&bulk_skipped=${encodeURIComponent(
+      String(skipped)
+    )}${triggerQuery}`
+  );
+}
+
 async function enqueuePublishJobs(formData: FormData) {
   "use server";
   const postId = String(formData.get("post_id") || "").trim();
@@ -210,6 +333,8 @@ export default async function QueuePage({
   const retrySkipped = Array.isArray(params.retry_skipped) ? params.retry_skipped[0] : params.retry_skipped;
   const bulkRetried = Array.isArray(params.bulk_retried) ? params.bulk_retried[0] : params.bulk_retried;
   const bulkPosts = Array.isArray(params.bulk_posts) ? params.bulk_posts[0] : params.bulk_posts;
+  const bulkApproved = Array.isArray(params.bulk_approved) ? params.bulk_approved[0] : params.bulk_approved;
+  const bulkSkipped = Array.isArray(params.bulk_skipped) ? params.bulk_skipped[0] : params.bulk_skipped;
   const workersTriggered = Array.isArray(params.workers_triggered) ? params.workers_triggered[0] : params.workers_triggered;
   const workersReason = Array.isArray(params.workers_reason) ? params.workers_reason[0] : params.workers_reason;
 
@@ -228,6 +353,10 @@ export default async function QueuePage({
     .from("publish_jobs")
     .select("id", { count: "exact", head: true })
     .in("status", ["FAILED_FINAL", "FAILED_RETRYABLE"]);
+  const { count: approvablePostsCount } = await supabase
+    .from("posts")
+    .select("id", { count: "exact", head: true })
+    .in("status", ["READY_FOR_REVIEW", "DRAFT"]);
 
   const listError = postsError ? postsError.message : null;
   const items = (posts || []) as any[];
@@ -298,6 +427,25 @@ export default async function QueuePage({
         </div>
       ) : null}
 
+      {bulkApproved !== undefined ? (
+        <div className="card" style={{ borderColor: "rgba(34, 140, 34, 0.4)" }}>
+          <h3>Bulk approve complete</h3>
+          <p>
+            Approved {bulkApproved || "0"} post(s)
+            {bulkSkipped !== undefined ? `, skipped ${bulkSkipped}` : ""}.
+            {workersTriggered === "1"
+              ? " Renderer + publisher were triggered in background."
+              : workersReason === "already_running"
+                ? " Renderer/publisher already running in background."
+                : workersReason === "disabled"
+                  ? " Worker auto-trigger is disabled on this environment."
+                  : workersReason
+                    ? ` Worker trigger failed: ${workersReason}.`
+                    : ""}
+          </p>
+        </div>
+      ) : null}
+
       <div className="card">
         <div
           style={{
@@ -309,15 +457,23 @@ export default async function QueuePage({
           }}
         >
           <h3 style={{ margin: 0 }}>Publish operations</h3>
-          <form action={retryAllFailedPublishJobs}>
-            <button type="submit" className="secondary" disabled={!Number(failedPublishJobsCount || 0)}>
-              Requeue failed publish jobs ({failedPublishJobsCount || 0})
-            </button>
-          </form>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <form action={approveAllPosts}>
+              <button type="submit" className="secondary" disabled={!Number(approvablePostsCount || 0)}>
+                Approve all ({approvablePostsCount || 0})
+              </button>
+            </form>
+            <form action={retryAllFailedPublishJobs}>
+              <button type="submit" className="secondary" disabled={!Number(failedPublishJobsCount || 0)}>
+                Requeue failed publish jobs ({failedPublishJobsCount || 0})
+              </button>
+            </form>
+          </div>
         </div>
         <p style={{ marginTop: 10 }}>
-          Resets failed publish jobs to <strong>PENDING</strong>, clears provider errors, and keeps each post’s
-          scheduled timestamp.
+          Approve all moves every <strong>Approve</strong>-eligible post to <strong>APPROVED</strong> in one click
+          (single-row Approve remains available). Requeue failed publish jobs resets failed publish jobs to{" "}
+          <strong>PENDING</strong>, clears provider errors, and keeps each post’s scheduled timestamp.
         </p>
       </div>
 

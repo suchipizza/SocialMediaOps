@@ -1,5 +1,6 @@
 const GRAPH_API_VERSION = process.env.IG_GRAPH_API_VERSION || "v21.0";
 const GRAPH_BASE_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
+const GRAPH_REQUEST_TIMEOUT_MS = Number.parseInt(process.env.IG_GRAPH_REQUEST_TIMEOUT_MS || "45000", 10);
 
 function makePlatformError(code, message, options = {}) {
   const err = new Error(message || code);
@@ -19,6 +20,35 @@ function buildGraphUrl(pathname, params = {}) {
   return url;
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const timeoutMs = parsePositiveInt(GRAPH_REQUEST_TIMEOUT_MS, 45000);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw makePlatformError(
+        "platform_upstream_timeout",
+        `instagram_graph_timeout:${timeoutMs}`,
+        { retryable: true }
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function readJsonSafe(response) {
   try {
     return await response.json();
@@ -31,9 +61,16 @@ function isRetryableStatus(status) {
   return status === 429 || status >= 500;
 }
 
-function mapGraphErrorCode(responseStatus, graphCode, graphSubcode) {
+function isLikelyTransientMediaFetchError(message) {
+  const text = String(message || "");
+  if (!text) return false;
+  return /only photo or video can be accepted as media type/i.test(text);
+}
+
+function mapGraphErrorCode(responseStatus, graphCode, graphSubcode, graphMessage) {
   if (responseStatus === 401 || graphCode === 190) return "platform_auth_invalid";
   if (responseStatus === 403 || graphCode === 10 || graphCode === 200) return "platform_permission_denied";
+  if (isLikelyTransientMediaFetchError(graphMessage)) return "platform_media_unreachable";
   if (responseStatus === 400) return "platform_request_invalid";
   if (graphCode === 4 || graphCode === 17 || graphCode === 613) return "platform_rate_limited";
   if (isRetryableStatus(responseStatus)) return "platform_upstream_unavailable";
@@ -42,16 +79,19 @@ function mapGraphErrorCode(responseStatus, graphCode, graphSubcode) {
 }
 
 async function graphGet(pathname, params = {}) {
-  const response = await fetch(buildGraphUrl(pathname, params), {
+  const response = await fetchWithTimeout(buildGraphUrl(pathname, params), {
     method: "GET"
   });
   const json = await readJsonSafe(response);
   if (response.ok && json) return json;
   const graphError = json?.error || {};
-  const code = mapGraphErrorCode(response.status, graphError.code, graphError.error_subcode);
+  const code = mapGraphErrorCode(response.status, graphError.code, graphError.error_subcode, graphError.message);
   throw makePlatformError(code, graphError.message || `graph_get_failed:${response.status}`, {
     status: response.status,
-    retryable: isRetryableStatus(response.status) || code === "platform_rate_limited",
+    retryable:
+      isRetryableStatus(response.status) ||
+      code === "platform_rate_limited" ||
+      code === "platform_media_unreachable",
     raw: json
   });
 }
@@ -63,7 +103,7 @@ async function graphPost(pathname, body = {}) {
     encoded.set(key, String(value));
   }
 
-  const response = await fetch(`${GRAPH_BASE_URL}/${pathname}`, {
+  const response = await fetchWithTimeout(`${GRAPH_BASE_URL}/${pathname}`, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: encoded
@@ -71,10 +111,13 @@ async function graphPost(pathname, body = {}) {
   const json = await readJsonSafe(response);
   if (response.ok && json) return json;
   const graphError = json?.error || {};
-  const code = mapGraphErrorCode(response.status, graphError.code, graphError.error_subcode);
+  const code = mapGraphErrorCode(response.status, graphError.code, graphError.error_subcode, graphError.message);
   throw makePlatformError(code, graphError.message || `graph_post_failed:${response.status}`, {
     status: response.status,
-    retryable: isRetryableStatus(response.status) || code === "platform_rate_limited",
+    retryable:
+      isRetryableStatus(response.status) ||
+      code === "platform_rate_limited" ||
+      code === "platform_media_unreachable",
     raw: json
   });
 }

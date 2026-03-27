@@ -1,4 +1,5 @@
 import os from "node:os";
+import { createHmac } from "node:crypto";
 import {
   claimPublishJobs,
   markPublishJobFailed,
@@ -20,16 +21,134 @@ function logStructured(logger, event, fields = {}) {
   );
 }
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function resolveMediaProxyConfig() {
+  const baseUrl = String(process.env.PUBLISH_MEDIA_PROXY_BASE_URL || "").trim().replace(/\/+$/, "");
+  const secret = String(process.env.PUBLISH_MEDIA_PROXY_SECRET || "").trim();
+  const ttlSeconds = parsePositiveInt(process.env.PUBLISH_MEDIA_PROXY_TTL_SECONDS, 6 * 60 * 60);
+  if (!baseUrl || !secret) return null;
+  return { baseUrl, secret, ttlSeconds };
+}
+
+function signMediaProxyToken({ assetId, exp, secret }) {
+  return createHmac("sha256", secret).update(`${assetId}:${exp}`).digest("hex");
+}
+
+function buildMediaProxyUrl({ assetId, imageUrl, proxyConfig }) {
+  if (!proxyConfig || !assetId) return imageUrl;
+  const exp = Math.floor(Date.now() / 1000) + proxyConfig.ttlSeconds;
+  const sig = signMediaProxyToken({
+    assetId,
+    exp,
+    secret: proxyConfig.secret
+  });
+  const url = new URL(`${proxyConfig.baseUrl}/api/public/assets/${encodeURIComponent(String(assetId))}`);
+  url.searchParams.set("exp", String(exp));
+  url.searchParams.set("sig", sig);
+  return url.toString();
+}
+
 function buildPublishPayload(job, post, assets) {
   const hashtags = Array.isArray(post.hashtags) ? post.hashtags.filter(Boolean) : [];
   const caption = [String(post.caption || "").trim(), hashtags.join(" ").trim()].filter(Boolean).join("\n\n");
-  const imageUrls = assets.map(asset => asset.image_url);
+  const proxyConfig = resolveMediaProxyConfig();
+  const imageUrls = assets.map(asset =>
+    buildMediaProxyUrl({
+      assetId: asset.id,
+      imageUrl: asset.image_url,
+      proxyConfig
+    })
+  );
   return {
     platform: job.platform,
     postId: post.id,
     caption,
     imageUrls
   };
+}
+
+function isMediaContentType(contentType) {
+  if (!contentType) return false;
+  const base = String(contentType).split(";")[0].trim().toLowerCase();
+  return base.startsWith("image/") || base.startsWith("video/");
+}
+
+function mediaProbeError(code, message, options = {}) {
+  const err = new Error(message || code);
+  err.code = code;
+  err.retryable = options.retryable ?? true;
+  err.status = options.status ?? null;
+  err.url = options.url ?? null;
+  err.contentType = options.contentType ?? null;
+  return err;
+}
+
+async function probeMediaUrl(url, timeoutMs = parsePositiveInt(process.env.PUBLISH_MEDIA_PROBE_TIMEOUT_MS, 15000)) {
+  const timerController = new AbortController();
+  const timeout = setTimeout(() => timerController.abort(), Math.max(timeoutMs, 1000));
+  try {
+    let response = await fetch(url, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: timerController.signal
+    });
+
+    // Some media endpoints don't support HEAD and return 403/405.
+    if (!response.ok || response.status === 403 || response.status === 405) {
+      response = await fetch(url, {
+        method: "GET",
+        headers: { range: "bytes=0-1024" },
+        redirect: "follow",
+        signal: timerController.signal
+      });
+    }
+
+    if (!response.ok) {
+      throw mediaProbeError(
+        "platform_media_unreachable",
+        `platform_media_unreachable:${response.status}`,
+        { status: response.status, url }
+      );
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!isMediaContentType(contentType)) {
+      throw mediaProbeError(
+        "platform_media_invalid_content_type",
+        `platform_media_invalid_content_type:${contentType || "unknown"}`,
+        { status: response.status, url, contentType }
+      );
+    }
+
+    if (response.body && typeof response.body.cancel === "function") {
+      try {
+        await response.body.cancel();
+      } catch {
+        // best effort
+      }
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw mediaProbeError("platform_media_probe_timeout", "platform_media_probe_timeout", {
+        retryable: true,
+        url
+      });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function verifyPublishPayloadMedia(payload) {
+  for (const mediaUrl of payload.imageUrls || []) {
+    await probeMediaUrl(mediaUrl);
+  }
 }
 
 function isFatalPublishError(message) {
@@ -126,7 +245,7 @@ async function fetchPostWithAssets(supabase, postId) {
 
   const { data: assets, error: assetsError } = await supabase
     .from("assets")
-    .select("slide_index,image_url")
+    .select("id,slide_index,image_url")
     .eq("post_id", postId)
     .order("slide_index", { ascending: true });
   if (assetsError) throw new Error(`assets_fetch_failed:${assetsError.message}`);
@@ -145,6 +264,7 @@ async function publishForPlatform({ job, payload, post, dryRun }) {
   }
 
   if (job.platform === "instagram") {
+    await verifyPublishPayloadMedia(payload);
     const credentials = resolveInstagramCredentials(post);
     return publishInstagramCarousel({
       igAccessToken: credentials.accessToken,
